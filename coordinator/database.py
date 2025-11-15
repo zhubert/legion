@@ -8,9 +8,14 @@ and checkpoint information.
 import sqlite3
 import json
 from typing import Optional, List, Dict, Any
-from datetime import datetime
+from datetime import datetime, UTC
 from pathlib import Path
 import threading
+
+
+# Disable deprecated datetime adapters
+sqlite3.register_adapter(datetime, lambda val: val.isoformat())
+sqlite3.register_converter("TIMESTAMP", lambda val: datetime.fromisoformat(val.decode()))
 
 
 class Database:
@@ -40,7 +45,8 @@ class Database:
         if not hasattr(self._local, 'conn'):
             self._local.conn = sqlite3.connect(
                 self.db_path,
-                check_same_thread=False
+                check_same_thread=False,
+                detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES
             )
             self._local.conn.row_factory = sqlite3.Row
         return self._local.conn
@@ -138,7 +144,7 @@ class Database:
         conn = self._get_connection()
         cursor = conn.cursor()
 
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
 
         try:
             cursor.execute("""
@@ -175,7 +181,7 @@ class Database:
             UPDATE workers
             SET last_heartbeat = ?, status = 'online'
             WHERE worker_id = ?
-        """, (datetime.utcnow(), worker_id))
+        """, (datetime.now(UTC), worker_id))
 
         conn.commit()
         return cursor.rowcount > 0
@@ -345,7 +351,7 @@ class Database:
         conn = self._get_connection()
         cursor = conn.cursor()
 
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
 
         try:
             cursor.execute("""
@@ -375,7 +381,7 @@ class Database:
             UPDATE clusters
             SET worker_ids = ?, updated_at = ?
             WHERE cluster_id = ?
-        """, (json.dumps(worker_ids), datetime.utcnow(), cluster_id))
+        """, (json.dumps(worker_ids), datetime.now(UTC), cluster_id))
 
         conn.commit()
         return cursor.rowcount > 0
@@ -435,7 +441,7 @@ class Database:
                 checkpoint_id, version, global_step,
                 json.dumps(worker_shards),
                 json.dumps(metadata) if metadata else None,
-                datetime.utcnow()
+                datetime.now(UTC)
             ))
             conn.commit()
             return True
@@ -499,7 +505,7 @@ class Database:
             INSERT INTO metrics (
                 worker_id, global_step, loss, throughput, memory_usage_gb, timestamp
             ) VALUES (?, ?, ?, ?, ?, ?)
-        """, (worker_id, global_step, loss, throughput, memory_usage_gb, datetime.utcnow()))
+        """, (worker_id, global_step, loss, throughput, memory_usage_gb, datetime.now(UTC)))
 
         conn.commit()
         return True
@@ -529,7 +535,7 @@ class Database:
         conn = self._get_connection()
         cursor = conn.cursor()
 
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
 
         # Prepare batch insert data
         batch_data = [
