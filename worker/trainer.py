@@ -18,6 +18,10 @@ from sim.collectives import CollectiveCoordinator
 from worker.shard_manager import ShardManager
 from worker.telemetry import TelemetryReporter
 
+from communication.grpc_server import WorkerGRPCServer
+from communication.grpc_client import WorkerGRPCClient
+from communication.grpc_collectives import GRPCCollectiveOps
+
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +44,10 @@ class DistributedTrainer:
         compression: str = "none",
         latency_ms: float = 0.0,
         shard_manager: Optional[ShardManager] = None,
-        telemetry_reporter: Optional[TelemetryReporter] = None
+        telemetry_reporter: Optional[TelemetryReporter] = None,
+        grpc_client: Optional[WorkerGRPCClient] = None,
+        grpc_server: Optional[WorkerGRPCServer] = None,
+        worker_addresses: Optional[List[str]] = None
     ):
         """
         Initialize distributed trainer.
@@ -56,6 +63,9 @@ class DistributedTrainer:
             latency_ms: Simulated network latency
             shard_manager: Optional shard manager
             telemetry_reporter: Optional telemetry reporter
+            grpc_client: Optional gRPC client for distributed training
+            grpc_server: Optional gRPC server for serving parameters
+            worker_addresses: Optional list of worker addresses for distributed training
         """
         self.worker_id = worker_id
         self.rank = rank
@@ -70,10 +80,17 @@ class DistributedTrainer:
         self.shard_manager = shard_manager
         self.telemetry_reporter = telemetry_reporter
 
+        # gRPC components for distributed training
+        self.grpc_client = grpc_client
+        self.grpc_server = grpc_server
+        self.worker_addresses = worker_addresses
+        self.use_grpc = grpc_client is not None and grpc_server is not None
+
         # Training components (will be initialized in setup)
         self.model: Optional[nn.Module] = None
         self.partitioner: Optional[Partitioner] = None
         self.collective_coordinator: Optional[CollectiveCoordinator] = None
+        self.grpc_collective_ops: Optional[GRPCCollectiveOps] = None
         self.worker_coordinator: Optional[WorkerCoordinator] = None
 
         # Training state
@@ -82,7 +99,8 @@ class DistributedTrainer:
 
         logger.info(
             f"Distributed trainer initialized: worker_id={worker_id}, "
-            f"rank={rank}/{world_size}, model={model_size}"
+            f"rank={rank}/{world_size}, model={model_size}, "
+            f"use_grpc={self.use_grpc}"
         )
 
     def setup(self):
@@ -108,10 +126,38 @@ class DistributedTrainer:
         # Create collective communication coordinator
         logger.info("Setting up collective communication...")
         max_tensor_size = max(p.num_params for p in self.partitioner.partitions)
-        self.collective_coordinator = CollectiveCoordinator(
-            self.world_size,
-            max_tensor_size
-        )
+
+        if self.use_grpc:
+            # Use gRPC-based collectives for real distributed training
+            logger.info("Using gRPC-based collective operations")
+            self.grpc_collective_ops = GRPCCollectiveOps(
+                rank=self.rank,
+                world_size=self.world_size,
+                worker_id=self.worker_id,
+                worker_addresses=self.worker_addresses,
+                grpc_client=self.grpc_client,
+                timeout=30.0
+            )
+
+            # Update gRPC server's parameter store with owned parameters
+            if self.grpc_server and self.shard_manager:
+                # We'll populate this during training as parameters are updated
+                logger.info("gRPC server parameter store ready for updates")
+
+            # For now, we'll use simulated collectives in the worker coordinator
+            # and add gRPC support in a future iteration
+            # TODO: Integrate GRPCCollectiveOps into WorkerCoordinator
+            self.collective_coordinator = CollectiveCoordinator(
+                self.world_size,
+                max_tensor_size
+            )
+        else:
+            # Use simulation-based collectives (shared memory)
+            logger.info("Using simulation-based collective operations")
+            self.collective_coordinator = CollectiveCoordinator(
+                self.world_size,
+                max_tensor_size
+            )
 
         # Create worker coordinator
         logger.info("Initializing worker coordinator...")

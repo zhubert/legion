@@ -17,6 +17,9 @@ from worker.shard_manager import ShardManager
 from worker.telemetry import TelemetryReporter
 from worker.trainer import DistributedTrainer
 
+from communication.grpc_server import WorkerGRPCServer
+from communication.grpc_client import WorkerGRPCClient
+
 from sim.model import create_model
 
 
@@ -54,6 +57,10 @@ class WorkerClient:
         self.shard_manager: Optional[ShardManager] = None
         self.telemetry_reporter: Optional[TelemetryReporter] = None
         self.trainer: Optional[DistributedTrainer] = None
+
+        # gRPC components (Phase 1 integration)
+        self.grpc_server: Optional[WorkerGRPCServer] = None
+        self.grpc_client: Optional[WorkerGRPCClient] = None
 
         # State
         self._running = False
@@ -125,6 +132,27 @@ class WorkerClient:
             )
             logger.info("✓ Telemetry reporter initialized")
 
+        # Initialize gRPC client for worker-to-worker communication
+        logger.info("Initializing gRPC client...")
+        self.grpc_client = WorkerGRPCClient(
+            worker_id=self.config.worker_id,
+            timeout=30.0
+        )
+        logger.info("✓ gRPC client initialized")
+
+        # Initialize gRPC server (will be started when training begins)
+        # Note: We'll create the server with an empty parameter store initially
+        # and update it when the model is partitioned
+        logger.info(f"Initializing gRPC server on port {self.config.port}...")
+        self.grpc_server = WorkerGRPCServer(
+            worker_id=self.config.worker_id,
+            parameter_store={},  # Empty initially, populated during training setup
+            host="0.0.0.0",
+            port=self.config.port
+        )
+        await self.grpc_server.start()
+        logger.info(f"✓ gRPC server started on {self.config.ip_address}:{self.config.port}")
+
         self._running = True
 
         logger.info("")
@@ -169,6 +197,17 @@ class WorkerClient:
             except Exception as e:
                 logger.error(f"Failed to save checkpoint: {e}")
 
+        # Stop gRPC server and client
+        if self.grpc_server:
+            logger.info("Stopping gRPC server...")
+            await self.grpc_server.stop()
+            logger.info("✓ gRPC server stopped")
+
+        if self.grpc_client:
+            logger.info("Closing gRPC client...")
+            await self.grpc_client.close()
+            logger.info("✓ gRPC client closed")
+
         # Deregister from coordinator
         if self.coordinator_client:
             logger.info("Deregistering from coordinator...")
@@ -186,7 +225,8 @@ class WorkerClient:
     async def run_training(
         self,
         dataset: List[Tuple[torch.Tensor, torch.Tensor]],
-        num_steps: Optional[int] = None
+        num_steps: Optional[int] = None,
+        use_distributed: bool = False
     ):
         """
         Run distributed training.
@@ -194,14 +234,48 @@ class WorkerClient:
         Args:
             dataset: Training dataset (list of input/target batches)
             num_steps: Number of training steps
+            use_distributed: Whether to use distributed multi-worker training
         """
         if not self._running:
             raise RuntimeError("Worker not started. Call start() first.")
 
-        # For now, assume we're the only worker (rank 0, world_size 1)
-        # In Phase 1.3 we'll add multi-worker support with gRPC
+        # Get cluster information from coordinator
         rank = 0
         world_size = 1
+        worker_addresses = []
+
+        if use_distributed:
+            logger.info("Fetching cluster information from coordinator...")
+            try:
+                # Get list of online workers
+                workers_response = await self.coordinator_client.get_workers(status="online")
+                if workers_response and 'workers' in workers_response:
+                    workers = workers_response['workers']
+                    world_size = len(workers)
+
+                    # Sort workers by worker_id to ensure consistent rank assignment
+                    workers = sorted(workers, key=lambda w: w.get('worker_id', ''))
+
+                    # Find our rank
+                    for i, worker in enumerate(workers):
+                        if worker.get('worker_id') == self.config.worker_id:
+                            rank = i
+                        # Build worker addresses list
+                        ip = worker.get('ip_address', 'localhost')
+                        port = worker.get('port', 50051)
+                        worker_addresses.append(f"{ip}:{port}")
+
+                    logger.info(
+                        f"Cluster configured: rank {rank}/{world_size}, "
+                        f"{len(worker_addresses)} workers"
+                    )
+                else:
+                    logger.warning("No cluster information available, falling back to single-worker mode")
+                    use_distributed = False
+            except Exception as e:
+                logger.error(f"Failed to get cluster information: {e}")
+                logger.warning("Falling back to single-worker mode")
+                use_distributed = False
 
         logger.info("Initializing training components...")
 
@@ -230,9 +304,13 @@ class WorkerClient:
             device=self.config.device,
             learning_rate=self.config.learning_rate,
             compression=self.config.compression,
-            latency_ms=0.0,  # No latency simulation for single worker
+            latency_ms=0.0,  # No latency simulation
             shard_manager=self.shard_manager,
-            telemetry_reporter=self.telemetry_reporter
+            telemetry_reporter=self.telemetry_reporter,
+            # gRPC components for distributed training
+            grpc_client=self.grpc_client if use_distributed else None,
+            grpc_server=self.grpc_server if use_distributed else None,
+            worker_addresses=worker_addresses if use_distributed else None
         )
         self.trainer.setup()
         logger.info("✓ Trainer initialized")

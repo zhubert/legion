@@ -201,7 +201,12 @@ class WorkerGRPCServer:
 
     async def start(self):
         """Start the gRPC server."""
-        self.server = grpc.aio.server()
+        # Configure server with larger message sizes for parameter transfer
+        options = [
+            ('grpc.max_send_message_length', 100 * 1024 * 1024),  # 100MB
+            ('grpc.max_receive_message_length', 100 * 1024 * 1024),  # 100MB
+        ]
+        self.server = grpc.aio.server(options=options)
         worker_pb2_grpc.add_WorkerServiceServicer_to_server(self.servicer, self.server)
 
         listen_addr = f"{self.host}:{self.port}"

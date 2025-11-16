@@ -375,6 +375,30 @@ class CoordinatorClient:
             logger.warning(f"Failed to get workers: {e}")
             return []
 
+    async def get_workers(self, status: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        Get workers from coordinator.
+
+        Args:
+            status: Filter by status ('online', 'offline', or None for all)
+
+        Returns:
+            Dictionary with 'workers' key containing list of worker info
+        """
+        try:
+            params = {"status": status} if status else {}
+            response = await self._request_with_retry(
+                "GET",
+                "/workers",
+                params=params
+            )
+
+            return response.json()
+
+        except httpx.HTTPError as e:
+            logger.warning(f"Failed to get workers: {e}")
+            return None
+
     async def get_cluster_members(self) -> List[Dict[str, Any]]:
         """
         Get members of this worker's cluster.

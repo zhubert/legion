@@ -51,7 +51,15 @@ class WorkerGRPCClient:
             gRPC async channel
         """
         if worker_address not in self.channels:
-            self.channels[worker_address] = grpc.aio.insecure_channel(worker_address)
+            # Configure channel with larger message sizes for parameter transfer
+            options = [
+                ('grpc.max_send_message_length', 100 * 1024 * 1024),  # 100MB
+                ('grpc.max_receive_message_length', 100 * 1024 * 1024),  # 100MB
+            ]
+            self.channels[worker_address] = grpc.aio.insecure_channel(
+                worker_address,
+                options=options
+            )
             logger.debug(f"Created channel to {worker_address}")
 
         return self.channels[worker_address]
