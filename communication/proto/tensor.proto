@@ -1,0 +1,73 @@
+syntax = "proto3";
+
+package legion;
+
+// Tensor metadata and data for efficient serialization
+message TensorProto {
+  // Shape of the tensor (e.g., [batch_size, seq_len, hidden_dim])
+  repeated int64 shape = 1;
+
+  // Data type of the tensor
+  enum DType {
+    FLOAT32 = 0;
+    FLOAT16 = 1;
+    BFLOAT16 = 2;
+    INT8 = 3;
+    INT32 = 4;
+    INT64 = 5;
+  }
+  DType dtype = 2;
+
+  // Raw tensor data (serialized as bytes)
+  bytes data = 3;
+
+  // Compression metadata (if compressed)
+  CompressionInfo compression = 4;
+
+  // Optional tensor name/identifier
+  string name = 5;
+}
+
+// Compression metadata for quantization and sparsification
+message CompressionInfo {
+  enum CompressionType {
+    NONE = 0;
+    INT8_QUANTIZE = 1;
+    TOPK_SPARSE = 2;
+    ONEBIT = 3;
+  }
+  CompressionType type = 1;
+
+  // For INT8: scale and zero_point for dequantization
+  // scale = (max - min) / 255
+  float scale = 2;
+  float zero_point = 3;
+
+  // For TopK: number of elements kept, indices of kept elements
+  int64 k = 4;
+  repeated int64 indices = 5;
+
+  // Original shape before compression (for reconstruction)
+  repeated int64 original_shape = 6;
+
+  // Original dtype before compression
+  TensorProto.DType original_dtype = 7;
+}
+
+// Chunk of tensor data for streaming large tensors
+message TensorChunk {
+  // Chunk sequence number (for ordering)
+  int64 chunk_id = 1;
+
+  // Total number of chunks for this tensor
+  int64 total_chunks = 2;
+
+  // Chunk data
+  bytes data = 3;
+
+  // Metadata (only in first chunk)
+  TensorProto.DType dtype = 4;
+  repeated int64 shape = 5;
+  CompressionInfo compression = 6;
+  string name = 7;
+}

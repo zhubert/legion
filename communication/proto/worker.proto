@@ -1,0 +1,137 @@
+syntax = "proto3";
+
+package legion;
+
+import "communication/proto/tensor.proto";
+
+// Worker service for peer-to-peer communication
+service WorkerService {
+  // Request a parameter shard from another worker
+  rpc GetParameters(ParameterRequest) returns (ParameterResponse) {}
+
+  // Stream large parameters in chunks
+  rpc StreamParameters(ParameterRequest) returns (stream TensorChunk) {}
+
+  // Send gradient updates to parameter owner
+  rpc SendGradients(GradientUpdate) returns (GradientAck) {}
+
+  // Participate in all-gather collective
+  rpc AllGather(AllGatherRequest) returns (AllGatherResponse) {}
+
+  // Participate in reduce-scatter collective
+  rpc ReduceScatter(ReduceScatterRequest) returns (ReduceScatterResponse) {}
+
+  // Ping for latency measurement
+  rpc Ping(PingRequest) returns (PingResponse) {}
+}
+
+// Request parameters from a worker
+message ParameterRequest {
+  // Worker ID requesting the parameters
+  string requester_id = 1;
+
+  // Shard ID or parameter range
+  int64 shard_start = 2;
+  int64 shard_end = 3;
+
+  // Optional: specific layer/parameter name
+  string parameter_name = 4;
+}
+
+// Response with parameters
+message ParameterResponse {
+  // The requested parameters
+  TensorProto parameters = 1;
+
+  // Shard info
+  int64 shard_start = 2;
+  int64 shard_end = 3;
+}
+
+// Send gradients to parameter owner
+message GradientUpdate {
+  // Worker ID sending the gradients
+  string sender_id = 1;
+
+  // Gradients for this shard
+  TensorProto gradients = 2;
+
+  // Training step number
+  int64 step = 3;
+
+  // Shard info
+  int64 shard_start = 4;
+  int64 shard_end = 5;
+}
+
+// Acknowledgment of gradient receipt
+message GradientAck {
+  bool success = 1;
+  string message = 2;
+}
+
+// All-gather collective operation
+message AllGatherRequest {
+  // Worker ID participating
+  string worker_id = 1;
+
+  // This worker's data to gather
+  TensorProto data = 2;
+
+  // Collective ID (for tracking)
+  string collective_id = 3;
+
+  // Ring position (for ring all-gather)
+  int32 rank = 4;
+  int32 world_size = 5;
+}
+
+message AllGatherResponse {
+  // Gathered data from all workers
+  repeated TensorProto gathered_data = 1;
+
+  bool success = 2;
+}
+
+// Reduce-scatter collective operation
+message ReduceScatterRequest {
+  // Worker ID participating
+  string worker_id = 1;
+
+  // This worker's data to reduce
+  TensorProto data = 2;
+
+  // Reduction operation (sum, avg, etc.)
+  enum ReduceOp {
+    SUM = 0;
+    AVG = 1;
+    MAX = 2;
+    MIN = 3;
+  }
+  ReduceOp reduce_op = 3;
+
+  // Collective ID (for tracking)
+  string collective_id = 4;
+
+  // Ring position
+  int32 rank = 5;
+  int32 world_size = 6;
+}
+
+message ReduceScatterResponse {
+  // Reduced data for this worker's shard
+  TensorProto reduced_data = 1;
+
+  bool success = 2;
+}
+
+// Ping for latency measurement
+message PingRequest {
+  string worker_id = 1;
+  int64 timestamp = 2;
+}
+
+message PingResponse {
+  int64 timestamp = 1;
+  int64 server_time = 2;
+}
