@@ -87,8 +87,9 @@ def deserialize_tensor(
     shape = tuple(proto.shape)
     tensor_np = tensor_np.reshape(shape)
 
-    # Convert to PyTorch tensor
-    tensor = torch.from_numpy(tensor_np)
+    # Copy to make writable before converting to PyTorch
+    # frombuffer creates read-only arrays, causing warnings
+    tensor = torch.from_numpy(tensor_np.copy())
 
     # Move to target device if specified
     if device:
@@ -240,4 +241,5 @@ def reassemble_chunks(chunks: list[tensor_pb2.TensorChunk]) -> torch.Tensor:
     tensor_np = np.frombuffer(tensor_bytes, dtype=np_dtype)
     tensor_np = tensor_np.reshape(shape)
 
-    return torch.from_numpy(tensor_np)
+    # Copy to make writable before converting to PyTorch
+    return torch.from_numpy(tensor_np.copy())
