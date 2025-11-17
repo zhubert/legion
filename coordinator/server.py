@@ -484,6 +484,56 @@ async def get_metrics(limit: int = 100):
     }
 
 
+@app.get("/training/ready")
+async def check_training_ready(min_workers: int = 2):
+    """
+    Check if enough workers are ready to start distributed training.
+
+    This endpoint allows workers to synchronize and wait for sufficient
+    peers before beginning training.
+
+    Query params:
+    - min_workers: Minimum number of online workers required (default: 2)
+
+    Returns:
+    - ready: Boolean indicating if training can start
+    - active_workers: Number of currently online workers
+    - min_workers: Required minimum
+    - workers: List of active worker information
+    """
+    # Get all online workers
+    active_workers = registry.list_workers(status="online")
+    num_active = len(active_workers)
+
+    # Sort workers by worker_id for consistent rank assignment
+    workers_sorted = sorted(active_workers, key=lambda w: w['worker_id'])
+
+    # Build worker addresses for distributed training
+    worker_info = [
+        {
+            'worker_id': w['worker_id'],
+            'ip_address': w['ip_address'],
+            'port': w['port'],
+            'rank': i  # Assign rank based on sorted order
+        }
+        for i, w in enumerate(workers_sorted)
+    ]
+
+    ready = num_active >= min_workers
+
+    logger.info(
+        f"Training readiness check: {num_active}/{min_workers} workers "
+        f"(ready={ready})"
+    )
+
+    return {
+        "ready": ready,
+        "active_workers": num_active,
+        "min_workers": min_workers,
+        "workers": worker_info
+    }
+
+
 @app.websocket("/ws/events")
 async def websocket_endpoint(websocket: WebSocket):
     """

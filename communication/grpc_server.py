@@ -7,6 +7,7 @@ in collective operations (all-gather, reduce-scatter).
 
 import asyncio
 import logging
+import time
 from typing import Dict, Optional
 import grpc
 import torch
@@ -36,6 +37,15 @@ class WorkerServicer(worker_pb2_grpc.WorkerServiceServicer):
         """
         self.worker_id = worker_id
         self.parameter_store = parameter_store
+
+        # Gradient accumulator: {step: {shard_id: [gradients from each worker]}}
+        self.gradient_accumulator: Dict[int, Dict[str, list]] = {}
+        self.gradient_lock = asyncio.Lock()
+
+        # Track expected number of gradient contributions per step
+        # This will be set when training starts (world_size - 1, excluding self)
+        self.expected_gradient_count = 0
+
         logger.info(f"Initialized WorkerServicer for worker {worker_id}")
 
     async def GetParameters(
@@ -126,25 +136,53 @@ class WorkerServicer(worker_pb2_grpc.WorkerServiceServicer):
         """
         Receive gradient updates from another worker.
 
-        In a real implementation, this would accumulate gradients for parameter updates.
-        For now, we just acknowledge receipt.
+        Accumulates gradients for the specified training step and shard.
+        When all workers have contributed, the accumulated gradients are ready
+        for the optimizer step.
         """
         logger.debug(
             f"Received gradients from {request.sender_id} "
-            f"for step {request.step}"
+            f"for step {request.step}, shard [{request.shard_start}:{request.shard_end}]"
         )
 
         try:
             # Deserialize gradients
             gradients = deserialize_tensor(request.gradients)
 
-            # TODO: Accumulate gradients for optimizer step
-            # This will be implemented in the training loop integration
+            # Accumulate gradients with proper synchronization
+            async with self.gradient_lock:
+                step = request.step
+                shard_id = f"{request.shard_start}_{request.shard_end}"
+
+                # Initialize step accumulator if needed
+                if step not in self.gradient_accumulator:
+                    self.gradient_accumulator[step] = {}
+
+                # Initialize shard accumulator if needed
+                if shard_id not in self.gradient_accumulator[step]:
+                    self.gradient_accumulator[step][shard_id] = []
+
+                # Add this worker's gradient contribution
+                self.gradient_accumulator[step][shard_id].append({
+                    'sender_id': request.sender_id,
+                    'gradients': gradients,
+                    'timestamp': time.time()
+                })
+
+                num_contributions = len(self.gradient_accumulator[step][shard_id])
+
+                logger.debug(
+                    f"Accumulated gradient {num_contributions} for step {step}, "
+                    f"shard {shard_id}"
+                )
 
             # Acknowledge
             ack = worker_pb2.GradientAck()
             ack.success = True
-            ack.message = f"Gradients received for step {request.step}"
+            ack.message = (
+                f"Gradient received for step {step} "
+                f"({num_contributions} total contributions)"
+            )
 
             return ack
 
@@ -154,6 +192,101 @@ class WorkerServicer(worker_pb2_grpc.WorkerServiceServicer):
             ack.success = False
             ack.message = str(e)
             return ack
+
+    async def get_accumulated_gradients(
+        self,
+        step: int,
+        shard_id: str,
+        reduce_op: str = "sum"
+    ) -> Optional[torch.Tensor]:
+        """
+        Get accumulated gradients for a specific step and shard.
+
+        Aggregates all gradient contributions using the specified reduction operation.
+
+        Args:
+            step: Training step number
+            shard_id: Shard identifier (format: "start_end")
+            reduce_op: Reduction operation ('sum' or 'mean')
+
+        Returns:
+            Aggregated gradient tensor or None if not ready
+        """
+        async with self.gradient_lock:
+            if step not in self.gradient_accumulator:
+                return None
+
+            if shard_id not in self.gradient_accumulator[step]:
+                return None
+
+            contributions = self.gradient_accumulator[step][shard_id]
+
+            if len(contributions) == 0:
+                return None
+
+            # Aggregate gradients
+            gradients = [c['gradients'] for c in contributions]
+
+            if reduce_op == "sum":
+                aggregated = torch.sum(torch.stack(gradients), dim=0)
+            elif reduce_op == "mean":
+                aggregated = torch.mean(torch.stack(gradients), dim=0)
+            else:
+                raise ValueError(f"Unknown reduce_op: {reduce_op}")
+
+            logger.debug(
+                f"Aggregated {len(gradients)} gradient contributions "
+                f"for step {step}, shard {shard_id} using {reduce_op}"
+            )
+
+            return aggregated
+
+    async def clear_gradients(self, step: int):
+        """
+        Clear accumulated gradients for a specific step.
+
+        Called after optimizer step to free memory.
+
+        Args:
+            step: Training step number
+        """
+        async with self.gradient_lock:
+            if step in self.gradient_accumulator:
+                del self.gradient_accumulator[step]
+                logger.debug(f"Cleared gradients for step {step}")
+
+    def set_expected_gradient_count(self, count: int):
+        """
+        Set the expected number of gradient contributions per step.
+
+        This should be world_size - 1 (all workers except self).
+
+        Args:
+            count: Expected number of contributions
+        """
+        self.expected_gradient_count = count
+        logger.info(f"Set expected gradient count to {count}")
+
+    async def is_step_ready(self, step: int, shard_id: str) -> bool:
+        """
+        Check if all expected gradients have been received for a step.
+
+        Args:
+            step: Training step number
+            shard_id: Shard identifier
+
+        Returns:
+            True if all expected gradients received, False otherwise
+        """
+        async with self.gradient_lock:
+            if step not in self.gradient_accumulator:
+                return False
+
+            if shard_id not in self.gradient_accumulator[step]:
+                return False
+
+            num_contributions = len(self.gradient_accumulator[step][shard_id])
+            return num_contributions >= self.expected_gradient_count
 
     async def Ping(
         self, request: worker_pb2.PingRequest, context: grpc.aio.ServicerContext

@@ -140,13 +140,16 @@ class DistributedTrainer:
             )
 
             # Update gRPC server's parameter store with owned parameters
-            if self.grpc_server and self.shard_manager:
-                # We'll populate this during training as parameters are updated
+            if self.grpc_server:
+                # Set expected gradient count (world_size - 1, excluding self)
+                self.grpc_server.servicer.set_expected_gradient_count(self.world_size - 1)
+                logger.info(f"gRPC server expects {self.world_size - 1} gradient contributions per step")
+
+                # We'll populate parameter store during training as parameters are updated
                 logger.info("gRPC server parameter store ready for updates")
 
-            # For now, we'll use simulated collectives in the worker coordinator
-            # and add gRPC support in a future iteration
-            # TODO: Integrate GRPCCollectiveOps into WorkerCoordinator
+            # For gRPC mode, we still need a collective coordinator for the worker coordinator
+            # but we'll override the collective ops with gRPC-based ones
             self.collective_coordinator = CollectiveCoordinator(
                 self.world_size,
                 max_tensor_size
@@ -208,13 +211,34 @@ class DistributedTrainer:
         losses = []
         start_time = time.time()
 
+        # Choose training path based on whether we're using gRPC
+        if self.use_grpc:
+            # Real distributed training with gRPC
+            results = await self._train_distributed_grpc(dataset, num_steps, checkpoint_interval)
+        else:
+            # Simulation-based training (single-process multi-worker)
+            results = await self._train_simulation(dataset, num_steps, checkpoint_interval)
+
+        return results
+
+    async def _train_simulation(
+        self,
+        dataset: List[Tuple[torch.Tensor, torch.Tensor]],
+        num_steps: int,
+        checkpoint_interval: int
+    ) -> Dict[str, Any]:
+        """
+        Training loop using simulation-based collectives (shared memory).
+
+        Used for single-process testing.
+        """
+        losses = []
+        start_time = time.time()
+
         for step, batch in enumerate(dataset[:num_steps]):
             step_start = time.time()
 
             # Prepare batches for simulation (WorkerCoordinator manages all workers)
-            # Note: In real distributed training with gRPC, each worker process runs
-            # independently and has already loaded its own shard via create_distributed_dataset().
-            # This simulation mode still uses identical batches for simplicity.
             batches = [batch for _ in range(self.world_size)]
 
             # Execute training step
@@ -284,6 +308,129 @@ class DistributedTrainer:
         logger.info(
             f"Training complete! "
             f"{num_steps} steps in {total_time:.2f}s "
+            f"({results['steps_per_sec']:.2f} steps/s)"
+        )
+
+        return results
+
+    async def _train_distributed_grpc(
+        self,
+        dataset: List[Tuple[torch.Tensor, torch.Tensor]],
+        num_steps: int,
+        checkpoint_interval: int
+    ) -> Dict[str, Any]:
+        """
+        Training loop using gRPC-based distributed collectives.
+
+        Each worker runs independently and coordinates via gRPC.
+        """
+        logger.info(f"Starting gRPC distributed training: rank {self.rank}/{self.world_size}")
+
+        losses = []
+        start_time = time.time()
+
+        # Get this worker's owned parameters
+        owned_params = {}
+        for name, param in self.model.named_parameters():
+            if name in self.partitioner.partitions[self.rank].param_names:
+                owned_params[name] = param.data.clone()
+                # Update gRPC server's parameter store
+                self.grpc_server.update_parameters(name, param.data)
+
+        logger.info(f"Worker owns {len(owned_params)} parameter groups")
+
+        # Create optimizer for owned parameters
+        optimizer = torch.optim.Adam(
+            [p for p in self.model.parameters() if p.requires_grad],
+            lr=self.learning_rate
+        )
+
+        for step, (inputs, targets) in enumerate(dataset[:num_steps]):
+            step_start = time.time()
+
+            # Move to device
+            inputs = inputs.to(self.device)
+            targets = targets.to(self.device)
+
+            # TODO: Phase 1 - For now, we use the simulation path
+            # Phase 2 will implement full gRPC-based ZeRO-3 training
+            # with all-gather for forward/backward and reduce-scatter for gradients
+
+            # Temporary: Use simulation mode worker to execute step
+            batches = [(inputs, targets) for _ in range(self.world_size)]
+            metrics = self.worker_coordinator.train_step(batches)
+            worker_metrics = metrics[self.rank]
+            loss = worker_metrics['loss']
+            losses.append(loss)
+
+            # TODO Phase 2: Real distributed training step
+            # 1. All-gather parameters from all workers via gRPC
+            # 2. Forward pass with full model
+            # 3. Backward pass to compute gradients
+            # 4. Reduce-scatter gradients to parameter owners via gRPC
+            # 5. Update owned parameters only
+            # 6. Update gRPC server's parameter store
+
+            # Calculate throughput
+            step_time = time.time() - step_start
+            throughput = 1.0 / step_time if step_time > 0 else 0.0
+
+            # Report telemetry
+            if self.telemetry_reporter:
+                memory_usage = 0.0
+                if self.shard_manager:
+                    mem_info = self.shard_manager.get_memory_usage()
+                    memory_usage = mem_info.get('total_gb', 0.0)
+
+                await self.telemetry_reporter.report_step_async(
+                    step=step,
+                    loss=loss,
+                    throughput=throughput,
+                    memory_usage_gb=memory_usage
+                )
+
+            # Print progress
+            if (step + 1) % 10 == 0 or step == 0:
+                avg_loss = sum(losses[-10:]) / len(losses[-10:])
+                elapsed = time.time() - start_time
+                steps_per_sec = (step + 1) / elapsed if elapsed > 0 else 0.0
+
+                logger.info(
+                    f"Rank {self.rank} | "
+                    f"Step {step+1:3d}/{num_steps} | "
+                    f"Loss: {loss:.4f} | "
+                    f"Avg Loss: {avg_loss:.4f} | "
+                    f"Speed: {steps_per_sec:.2f} steps/s"
+                )
+
+            # Save checkpoint
+            if self.shard_manager and (step + 1) % checkpoint_interval == 0:
+                try:
+                    checkpoint_path = self.shard_manager.save_checkpoint(
+                        global_step=step + 1
+                    )
+                    logger.info(f"Checkpoint saved: {checkpoint_path}")
+                except Exception as e:
+                    logger.error(f"Failed to save checkpoint: {e}")
+
+            self._current_step = step + 1
+
+        total_time = time.time() - start_time
+
+        # Training results
+        results = {
+            'num_steps': num_steps,
+            'total_time': total_time,
+            'steps_per_sec': num_steps / total_time if total_time > 0 else 0.0,
+            'final_loss': losses[-1] if losses else None,
+            'initial_loss': losses[0] if losses else None,
+            'avg_loss': sum(losses) / len(losses) if losses else None,
+            'losses': losses
+        }
+
+        logger.info(
+            f"Distributed training complete! "
+            f"Rank {self.rank}: {num_steps} steps in {total_time:.2f}s "
             f"({results['steps_per_sec']:.2f} steps/s)"
         )
 
