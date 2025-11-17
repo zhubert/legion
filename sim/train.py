@@ -106,8 +106,10 @@ def train_distributed(
 
     losses = []
     for step, batch in enumerate(dataset):
-        # Each worker gets the same batch (data parallelism)
-        # In real system, workers would have different batches
+        # Simulation mode: All workers get the same batch for simplicity.
+        # In real distributed training, each worker loads different data from
+        # its sharded dataset (see worker/client.py and core/dataset.py for
+        # create_distributed_dataset() which implements proper data parallelism).
         batches = [batch for _ in range(world_size)]
 
         # Execute training step

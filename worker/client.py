@@ -224,7 +224,7 @@ class WorkerClient:
 
     async def run_training(
         self,
-        dataset: List[Tuple[torch.Tensor, torch.Tensor]],
+        dataset: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         num_steps: Optional[int] = None,
         use_distributed: bool = False
     ):
@@ -232,7 +232,7 @@ class WorkerClient:
         Run distributed training.
 
         Args:
-            dataset: Training dataset (list of input/target batches)
+            dataset: Training dataset (optional, will be created if not provided)
             num_steps: Number of training steps
             use_distributed: Whether to use distributed multi-worker training
         """
@@ -278,6 +278,33 @@ class WorkerClient:
                 use_distributed = False
 
         logger.info("Initializing training components...")
+
+        # Create dataset if not provided
+        if dataset is None:
+            if use_distributed and world_size > 1:
+                from core.dataset import create_distributed_dataset
+                dataset = create_distributed_dataset(
+                    vocab_size=1000,
+                    seq_len=self.config.seq_len,
+                    num_batches=num_steps or self.config.num_steps,
+                    batch_size=self.config.batch_size,
+                    rank=rank,
+                    world_size=world_size,
+                    seed=42
+                )
+                logger.info(
+                    f"Created distributed dataset shard for rank {rank}/{world_size} "
+                    f"(effective global batch size: {self.config.batch_size * world_size})"
+                )
+            else:
+                from core.dataset import create_dummy_dataset
+                dataset = create_dummy_dataset(
+                    vocab_size=1000,
+                    seq_len=self.config.seq_len,
+                    num_batches=num_steps or self.config.num_steps,
+                    batch_size=self.config.batch_size
+                )
+                logger.info(f"Created single-worker dataset (batch size: {self.config.batch_size})")
 
         # Create model for shard manager
         model = create_model(self.config.model_size)
@@ -437,17 +464,9 @@ async def main(config: Optional[WorkerConfig] = None):
         # Start worker
         await worker.start()
 
-        # Create dummy dataset for testing
-        from core.dataset import create_dummy_dataset
-        dataset = create_dummy_dataset(
-            vocab_size=1000,
-            seq_len=config.seq_len,
-            num_batches=config.num_steps,
-            batch_size=config.batch_size
-        )
-
+        # Note: Dataset creation moved inside run_training() where rank/world_size are known
         # Run training
-        await worker.run_training(dataset, num_steps=config.num_steps)
+        await worker.run_training(num_steps=config.num_steps)
 
         # Wait for shutdown signal
         # await worker.wait_for_shutdown()

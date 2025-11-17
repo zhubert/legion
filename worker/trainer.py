@@ -211,8 +211,10 @@ class DistributedTrainer:
         for step, batch in enumerate(dataset[:num_steps]):
             step_start = time.time()
 
-            # Prepare batches for all workers (data parallelism)
-            # In real system, each worker would have different batch
+            # Prepare batches for simulation (WorkerCoordinator manages all workers)
+            # Note: In real distributed training with gRPC, each worker process runs
+            # independently and has already loaded its own shard via create_distributed_dataset().
+            # This simulation mode still uses identical batches for simplicity.
             batches = [batch for _ in range(self.world_size)]
 
             # Execute training step
