@@ -25,6 +25,8 @@ Legion has completed the proof-of-concept simulation (Phase 0) and is now in Pha
 - ✅ gRPC worker-to-worker communication
 - ✅ Ring-based collectives (8x-512x bandwidth savings)
 - ✅ Multi-worker integration tests
+- ✅ HuggingFace dataset integration (FineWeb, The Pile, Shakespeare, etc.)
+- ✅ Proper data parallelism with dataset sharding
 
 **Next Steps (Phase 1 Remaining):**
 - Real multi-machine distributed training (2-4 workers)
@@ -84,19 +86,52 @@ Workers will automatically:
 - Form a training cluster
 - Exchange parameters via gRPC
 
+### Training on Real Datasets
+
+Legion supports HuggingFace datasets for production training:
+
+```bash
+# Install HuggingFace dependencies (optional)
+pip install datasets transformers
+
+# Train on Tiny Shakespeare (good for testing)
+python -m worker.client \
+    --dataset-type huggingface \
+    --dataset-name tiny_shakespeare \
+    --batch-size 16 \
+    --seq-len 256
+
+# Train on FineWeb-Edu (high-quality web data)
+python -m worker.client \
+    --dataset-type huggingface \
+    --dataset-name fineweb-edu \
+    --batch-size 8 \
+    --seq-len 1024
+```
+
+**Available datasets:**
+- `fineweb` - 15T tokens from CommonCrawl
+- `fineweb-edu` - 1.3T high-quality educational tokens
+- `pile` - 825GB diverse dataset
+- `tiny_shakespeare` - 1MB for testing
+- `shakespeare` - Complete works of Shakespeare
+
+See [DATASETS.md](DATASETS.md) for detailed dataset documentation.
+
 ## Project Structure
 
 ```
 legion/
 ├── PROJECT.md              # Detailed project plan
 ├── README.md               # This file
+├── DATASETS.md             # Dataset usage guide
 ├── CLAUDE.md               # Development guide
 ├── requirements.txt        # Python dependencies
 ├── core/                   # Shared core functionality
 │   ├── model.py            # Model definitions (TinyGPT)
 │   ├── partitioner.py      # ZeRO-3 parameter partitioning
 │   ├── compression.py      # Gradient compression (INT8, TopK)
-│   └── dataset.py          # Dataset utilities
+│   └── dataset.py          # Dataset utilities (HuggingFace integration)
 ├── sim/                    # Phase 0: Single-machine simulation
 │   ├── collectives.py      # Shared-memory collectives
 │   ├── worker.py           # Simulated worker coordinator

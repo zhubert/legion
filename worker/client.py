@@ -281,7 +281,30 @@ class WorkerClient:
 
         # Create dataset if not provided
         if dataset is None:
-            if use_distributed and world_size > 1:
+            dataset_type = self.config.dataset_type
+            dataset_name = self.config.dataset_name
+
+            # Determine dataset type from config
+            if dataset_type == "huggingface" and dataset_name:
+                # HuggingFace dataset (fineweb, pile, shakespeare, etc.)
+                logger.info(f"Loading HuggingFace dataset: {dataset_name}")
+                from core.dataset import create_huggingface_dataset
+                dataset = create_huggingface_dataset(
+                    dataset_name=dataset_name,
+                    rank=rank,
+                    world_size=world_size,
+                    num_batches=num_steps or self.config.num_steps,
+                    batch_size=self.config.batch_size,
+                    tokenizer_name=self.config.tokenizer_name,
+                    seq_len=self.config.seq_len,
+                    seed=42
+                )
+                logger.info(
+                    f"Loaded HuggingFace dataset '{dataset_name}' for rank {rank}/{world_size} "
+                    f"(effective global batch size: {self.config.batch_size * world_size})"
+                )
+            elif dataset_type == "distributed_dummy" or (use_distributed and world_size > 1):
+                # Distributed dummy dataset (for testing multi-worker)
                 from core.dataset import create_distributed_dataset
                 dataset = create_distributed_dataset(
                     vocab_size=1000,
@@ -293,10 +316,11 @@ class WorkerClient:
                     seed=42
                 )
                 logger.info(
-                    f"Created distributed dataset shard for rank {rank}/{world_size} "
+                    f"Created distributed dummy dataset shard for rank {rank}/{world_size} "
                     f"(effective global batch size: {self.config.batch_size * world_size})"
                 )
             else:
+                # Single-worker dummy dataset (default)
                 from core.dataset import create_dummy_dataset
                 dataset = create_dummy_dataset(
                     vocab_size=1000,
@@ -304,7 +328,7 @@ class WorkerClient:
                     num_batches=num_steps or self.config.num_steps,
                     batch_size=self.config.batch_size
                 )
-                logger.info(f"Created single-worker dataset (batch size: {self.config.batch_size})")
+                logger.info(f"Created single-worker dummy dataset (batch size: {self.config.batch_size})")
 
         # Create model for shard manager
         model = create_model(self.config.model_size)

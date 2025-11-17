@@ -83,6 +83,11 @@ class WorkerConfig:
     # Compression
     compression: str = "none"  # "none", "int8", "topk"
 
+    # Dataset configuration
+    dataset_name: Optional[str] = None  # e.g., "fineweb-edu", "pile", "tiny_shakespeare"
+    dataset_type: str = "dummy"  # "dummy", "distributed_dummy", or "huggingface"
+    tokenizer_name: Optional[str] = None  # Override default tokenizer for dataset
+
     # Heartbeat settings
     heartbeat_interval: int = 30  # seconds between heartbeats
     heartbeat_timeout: int = 90  # coordinator timeout threshold
@@ -154,7 +159,11 @@ class WorkerConfig:
             'bandwidth_mbps': self.bandwidth_mbps,
             'model_size': self.model_size,
             'batch_size': self.batch_size,
+            'seq_len': self.seq_len,
             'learning_rate': self.learning_rate,
+            'dataset_name': self.dataset_name,
+            'dataset_type': self.dataset_type,
+            'tokenizer_name': self.tokenizer_name,
             'heartbeat_interval': self.heartbeat_interval,
             'telemetry_enabled': self.telemetry_enabled,
             'checkpoint_enabled': self.checkpoint_enabled
