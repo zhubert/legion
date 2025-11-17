@@ -4,8 +4,8 @@ Tests for parameter partitioning (ZeRO-3)
 
 import pytest
 import torch
-from sim.model import TinyGPT
-from sim.partitioner import (
+from core.model import TinyGPT
+from core.partitioner import (
     Partitioner,
     ParameterPartition,
     flatten_parameters,

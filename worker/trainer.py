@@ -10,8 +10,8 @@ from typing import List, Tuple, Optional, Dict, Any
 import torch
 import torch.nn as nn
 
-from sim.model import create_model
-from sim.partitioner import Partitioner
+from core.model import create_model
+from core.partitioner import Partitioner
 from sim.worker import WorkerCoordinator
 from sim.collectives import CollectiveCoordinator
 

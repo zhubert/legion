@@ -4,7 +4,7 @@ Tests for gradient compression methods
 
 import pytest
 import torch
-from sim.compression import (
+from core.compression import (
     INT8Quantizer,
     BlockQuantizer,
     TopKSparsifier,

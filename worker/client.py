@@ -20,7 +20,7 @@ from worker.trainer import DistributedTrainer
 from communication.grpc_server import WorkerGRPCServer
 from communication.grpc_client import WorkerGRPCClient
 
-from sim.model import create_model
+from core.model import create_model
 
 
 # Configure logging
@@ -438,7 +438,7 @@ async def main(config: Optional[WorkerConfig] = None):
         await worker.start()
 
         # Create dummy dataset for testing
-        from sim.train import create_dummy_dataset
+        from core.dataset import create_dummy_dataset
         dataset = create_dummy_dataset(
             vocab_size=1000,
             seq_len=config.seq_len,

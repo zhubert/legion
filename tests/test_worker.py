@@ -25,7 +25,7 @@ from worker.shard_manager import ShardManager
 from worker.telemetry import TelemetryReporter, MetricRecord
 from worker.trainer import DistributedTrainer
 
-from sim.model import create_model
+from core.model import create_model
 
 
 class TestWorkerConfig:

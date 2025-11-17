@@ -4,7 +4,7 @@ Tests for TinyGPT model implementation
 
 import pytest
 import torch
-from sim.model import TinyGPT, create_model, MultiHeadAttention, FeedForward, TransformerBlock
+from core.model import TinyGPT, create_model, MultiHeadAttention, FeedForward, TransformerBlock
 
 
 class TestTinyGPT:

@@ -11,9 +11,9 @@ import torch
 import torch.nn as nn
 from torch.optim import Optimizer
 
-from sim.partitioner import ParameterPartition, flatten_parameters, unflatten_parameters
+from core.partitioner import ParameterPartition, flatten_parameters, unflatten_parameters
+from core.compression import CompressionManager
 from sim.collectives import CollectiveOps
-from sim.compression import CompressionManager
 
 
 class Worker:

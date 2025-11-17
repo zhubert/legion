@@ -10,40 +10,11 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 
-from sim.model import create_model
-from sim.partitioner import Partitioner
+from core.model import create_model
+from core.partitioner import Partitioner
+from core.dataset import create_dummy_dataset
 from sim.collectives import CollectiveCoordinator
 from sim.worker import WorkerCoordinator
-
-
-def create_dummy_dataset(
-    vocab_size: int,
-    seq_len: int,
-    num_batches: int,
-    batch_size: int
-) -> list:
-    """
-    Create dummy dataset for testing.
-
-    In a real system, this would load actual text data.
-
-    Args:
-        vocab_size: Size of vocabulary
-        seq_len: Sequence length
-        num_batches: Number of batches to create
-        batch_size: Batch size
-
-    Returns:
-        List of (inputs, targets) tuples
-    """
-    batches = []
-    for _ in range(num_batches):
-        inputs = torch.randint(0, vocab_size, (batch_size, seq_len))
-        # Targets are inputs shifted by one (language modeling)
-        targets = torch.randint(0, vocab_size, (batch_size, seq_len))
-        batches.append((inputs, targets))
-
-    return batches
 
 
 def train_distributed(

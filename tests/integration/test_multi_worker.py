@@ -16,7 +16,7 @@ from coordinator.registry import WorkerRegistry
 from coordinator.clustering import ClusterManager
 from worker.client import WorkerClient
 from worker.config import WorkerConfig
-from sim.train import create_dummy_dataset
+from core.dataset import create_dummy_dataset
 
 
 @pytest.fixture

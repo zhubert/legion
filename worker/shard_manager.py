@@ -12,7 +12,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from sim.partitioner import Partitioner, ParameterPartition
+from core.partitioner import Partitioner, ParameterPartition
 
 
 logger = logging.getLogger(__name__)
