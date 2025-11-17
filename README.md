@@ -92,11 +92,13 @@ legion/
 ├── README.md               # This file
 ├── CLAUDE.md               # Development guide
 ├── requirements.txt        # Python dependencies
+├── core/                   # Shared core functionality
+│   ├── model.py            # Model definitions (TinyGPT)
+│   ├── partitioner.py      # ZeRO-3 parameter partitioning
+│   ├── compression.py      # Gradient compression (INT8, TopK)
+│   └── dataset.py          # Dataset utilities
 ├── sim/                    # Phase 0: Single-machine simulation
-│   ├── model.py            # Tiny transformer for testing
-│   ├── partitioner.py      # Parameter partitioning (ZeRO-3)
-│   ├── collectives.py      # All-gather, reduce-scatter
-│   ├── compression.py      # Gradient compression
+│   ├── collectives.py      # Shared-memory collectives
 │   ├── worker.py           # Simulated worker coordinator
 │   └── train.py            # Simulation entry point
 ├── coordinator/            # Phase 1: Central coordinator
