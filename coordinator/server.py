@@ -484,6 +484,61 @@ async def get_metrics(limit: int = 100):
     }
 
 
+@app.post("/training/barrier")
+async def training_barrier(worker_id: str, step: str = "training_complete"):
+    """
+    Distributed barrier synchronization for workers.
+
+    Workers call this when they reach a barrier point (e.g., training complete).
+    The coordinator tracks which workers have reached the barrier.
+
+    Args:
+    - worker_id: ID of worker reaching barrier
+    - step: Barrier step name (default: "training_complete")
+
+    Returns:
+    - reached: Number of workers at this barrier
+    - total: Total number of online workers
+    - all_ready: True if all workers have reached the barrier
+    """
+    # Get all online workers
+    active_workers = registry.get_online_workers()
+    worker_ids = {w.worker_id for w in active_workers}
+    total_workers = len(worker_ids)
+
+    # Track barrier state in a simple dict (in production, use Redis or DB)
+    if not hasattr(app.state, 'barriers'):
+        app.state.barriers = {}
+
+    barrier_key = step
+    if barrier_key not in app.state.barriers:
+        app.state.barriers[barrier_key] = set()
+
+    # Add this worker to the barrier
+    app.state.barriers[barrier_key].add(worker_id)
+    reached = len(app.state.barriers[barrier_key])
+
+    # Check if all workers have reached
+    all_ready = app.state.barriers[barrier_key] >= worker_ids
+
+    logger.info(
+        f"Barrier '{step}': worker {worker_id} reached "
+        f"({reached}/{total_workers} workers)"
+    )
+
+    # Cleanup if all workers reached
+    if all_ready:
+        logger.info(f"Barrier '{step}' complete, all {total_workers} workers ready")
+        del app.state.barriers[barrier_key]
+
+    return {
+        "reached": reached,
+        "total": total_workers,
+        "all_ready": all_ready,
+        "waiting_for": list(worker_ids - app.state.barriers[barrier_key]) if not all_ready else []
+    }
+
+
 @app.get("/training/ready")
 async def check_training_ready(min_workers: int = 2):
     """
@@ -502,18 +557,18 @@ async def check_training_ready(min_workers: int = 2):
     - workers: List of active worker information
     """
     # Get all online workers
-    active_workers = registry.list_workers(status="online")
+    active_workers = registry.get_online_workers()
     num_active = len(active_workers)
 
     # Sort workers by worker_id for consistent rank assignment
-    workers_sorted = sorted(active_workers, key=lambda w: w['worker_id'])
+    workers_sorted = sorted(active_workers, key=lambda w: w.worker_id)
 
     # Build worker addresses for distributed training
     worker_info = [
         {
-            'worker_id': w['worker_id'],
-            'ip_address': w['ip_address'],
-            'port': w['port'],
+            'worker_id': w.worker_id,
+            'ip_address': w.ip_address,
+            'port': w.port,
             'rank': i  # Assign rank based on sorted order
         }
         for i, w in enumerate(workers_sorted)

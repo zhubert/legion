@@ -279,6 +279,22 @@ class WorkerClient:
 
         logger.info("Initializing training components...")
 
+        # If distributed, verify connectivity to peers
+        if use_distributed and len(worker_addresses) > 1:
+            logger.info("Verifying connectivity to peer workers...")
+            for i, addr in enumerate(worker_addresses):
+                if i == rank:
+                    continue  # Skip self
+
+                try:
+                    latency = await self.grpc_client.ping(addr)
+                    if latency is not None:
+                        logger.info(f"✓ Connected to worker at {addr} (latency: {latency:.1f}ms)")
+                    else:
+                        logger.warning(f"✗ Failed to ping worker at {addr}")
+                except Exception as e:
+                    logger.warning(f"✗ Cannot reach worker at {addr}: {e}")
+
         # Create dataset if not provided
         if dataset is None:
             dataset_type = self.config.dataset_type
@@ -358,6 +374,7 @@ class WorkerClient:
             latency_ms=0.0,  # No latency simulation
             shard_manager=self.shard_manager,
             telemetry_reporter=self.telemetry_reporter,
+            coordinator_client=self.coordinator_client if use_distributed else None,
             # gRPC components for distributed training
             grpc_client=self.grpc_client if use_distributed else None,
             grpc_server=self.grpc_server if use_distributed else None,

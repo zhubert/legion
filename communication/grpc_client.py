@@ -177,6 +177,7 @@ class WorkerGRPCClient:
         worker_address: str,
         gradients: torch.Tensor,
         step: int,
+        parameter_name: str = "",
         shard_start: int = 0,
         shard_end: int = -1,
     ) -> bool:
@@ -187,6 +188,7 @@ class WorkerGRPCClient:
             worker_address: Target worker address "host:port"
             gradients: Gradient tensor to send
             step: Training step number
+            parameter_name: Name of the parameter (for accumulation)
             shard_start: Start index of shard
             shard_end: End index of shard
 
@@ -197,8 +199,8 @@ class WorkerGRPCClient:
             channel = self.get_channel(worker_address)
             stub = worker_pb2_grpc.WorkerServiceStub(channel)
 
-            # Serialize gradients
-            grad_proto = serialize_tensor(gradients)
+            # Serialize gradients with parameter name
+            grad_proto = serialize_tensor(gradients, name=parameter_name)
 
             # Create request
             request = worker_pb2.GradientUpdate()

@@ -4,6 +4,7 @@ Distributed training integration for worker nodes.
 Wraps Phase 0 training loop with worker client integration for distributed training.
 """
 
+import asyncio
 import logging
 import time
 from typing import List, Tuple, Optional, Dict, Any
@@ -17,6 +18,7 @@ from sim.collectives import CollectiveCoordinator
 
 from worker.shard_manager import ShardManager
 from worker.telemetry import TelemetryReporter
+from worker.coordinator_client import CoordinatorClient
 
 from communication.grpc_server import WorkerGRPCServer
 from communication.grpc_client import WorkerGRPCClient
@@ -45,6 +47,7 @@ class DistributedTrainer:
         latency_ms: float = 0.0,
         shard_manager: Optional[ShardManager] = None,
         telemetry_reporter: Optional[TelemetryReporter] = None,
+        coordinator_client: Optional[CoordinatorClient] = None,
         grpc_client: Optional[WorkerGRPCClient] = None,
         grpc_server: Optional[WorkerGRPCServer] = None,
         worker_addresses: Optional[List[str]] = None
@@ -79,6 +82,7 @@ class DistributedTrainer:
         # External components
         self.shard_manager = shard_manager
         self.telemetry_reporter = telemetry_reporter
+        self.coordinator_client = coordinator_client
 
         # gRPC components for distributed training
         self.grpc_client = grpc_client
@@ -262,7 +266,7 @@ class DistributedTrainer:
 
                 await self.telemetry_reporter.report_step_async(
                     step=step,
-                    loss=loss,
+                    loss=loss.item() if isinstance(loss, torch.Tensor) else loss,
                     throughput=throughput,
                     memory_usage_gb=memory_usage
                 )
@@ -352,24 +356,129 @@ class DistributedTrainer:
             inputs = inputs.to(self.device)
             targets = targets.to(self.device)
 
-            # TODO: Phase 1 - For now, we use the simulation path
-            # Phase 2 will implement full gRPC-based ZeRO-3 training
-            # with all-gather for forward/backward and reduce-scatter for gradients
+            # === PHASE 1: Real Distributed Training with gRPC ===
 
-            # Temporary: Use simulation mode worker to execute step
-            batches = [(inputs, targets) for _ in range(self.world_size)]
-            metrics = self.worker_coordinator.train_step(batches)
-            worker_metrics = metrics[self.rank]
-            loss = worker_metrics['loss']
-            losses.append(loss)
-
-            # TODO Phase 2: Real distributed training step
             # 1. All-gather parameters from all workers via gRPC
-            # 2. Forward pass with full model
-            # 3. Backward pass to compute gradients
-            # 4. Reduce-scatter gradients to parameter owners via gRPC
-            # 5. Update owned parameters only
-            # 6. Update gRPC server's parameter store
+            all_gather_start = time.time()
+            all_params = {}
+
+            for name, param in self.model.named_parameters():
+                param_owner_rank = self._get_param_owner_rank(name)
+
+                if param_owner_rank == self.rank:
+                    # We own this parameter, use our local copy
+                    all_params[name] = param.data.clone()
+                else:
+                    # Fetch from the owner via gRPC with retry
+                    fetched = None
+                    for retry in range(3):
+                        fetched = await self.grpc_client.get_parameters(
+                            worker_address=self.worker_addresses[param_owner_rank],
+                            parameter_name=name,
+                            shard_start=0,
+                            shard_end=-1
+                        )
+                        if fetched is not None:
+                            break
+                        # Wait before retry (peer might still be starting up)
+                        if retry < 2:
+                            await asyncio.sleep(0.5)
+
+                    if fetched is not None:
+                        all_params[name] = fetched
+                    else:
+                        # Fallback: use current parameter value
+                        logger.warning(f"Failed to fetch {name} from rank {param_owner_rank} after retries, using local")
+                        all_params[name] = param.data.clone()
+
+            all_gather_time = time.time() - all_gather_start
+
+            # 2. Load all parameters into model for forward/backward
+            with torch.no_grad():
+                for name, param in self.model.named_parameters():
+                    param.data.copy_(all_params[name])
+
+            # 3. Forward pass
+            forward_start = time.time()
+            logits, loss = self.model(inputs, targets)
+            losses.append(loss.item())
+            forward_time = time.time() - forward_start
+
+            # 4. Backward pass to compute gradients
+            backward_start = time.time()
+            optimizer.zero_grad()
+            loss.backward()
+            backward_time = time.time() - backward_start
+
+            # 5. Reduce-scatter: Send gradients to parameter owners via gRPC
+            reduce_scatter_start = time.time()
+
+            for name, param in self.model.named_parameters():
+                if param.grad is None:
+                    continue
+
+                param_owner_rank = self._get_param_owner_rank(name)
+
+                if param_owner_rank != self.rank:
+                    # Send our gradient to the owner with retry
+                    success = False
+                    for retry in range(3):
+                        success = await self.grpc_client.send_gradients(
+                            worker_address=self.worker_addresses[param_owner_rank],
+                            gradients=param.grad,
+                            step=step,
+                            parameter_name=name,  # Pass parameter name for proper accumulation
+                            shard_start=0,
+                            shard_end=-1
+                        )
+                        if success:
+                            break
+                        if retry < 2:
+                            await asyncio.sleep(0.1)
+
+                    if not success:
+                        logger.warning(f"Failed to send gradient for {name} to rank {param_owner_rank}")
+
+            reduce_scatter_time = time.time() - reduce_scatter_start
+
+            # 6. Retrieve accumulated gradients for parameters we own
+            grad_retrieval_start = time.time()
+
+            for name, param in self.model.named_parameters():
+                if param.grad is None:
+                    continue
+
+                param_owner_rank = self._get_param_owner_rank(name)
+
+                if param_owner_rank == self.rank:
+                    # We own this parameter - get accumulated gradients from other workers
+                    # Wait briefly for gradients to arrive
+                    await asyncio.sleep(0.01)
+
+                    accumulated_grad = await self.grpc_server.servicer.get_accumulated_gradients(
+                        step=step,
+                        shard_id=name,  # Use parameter name
+                        reduce_op="sum"
+                    )
+
+                    if accumulated_grad is not None:
+                        # Add accumulated gradients from other workers to our own gradient
+                        param.grad.data.add_(accumulated_grad)
+
+            grad_retrieval_time = time.time() - grad_retrieval_start
+
+            # 7. Optimizer step (only updates parameters we own)
+            optimizer_start = time.time()
+            optimizer.step()
+            optimizer_time = time.time() - optimizer_start
+
+            # 8. Clear gradient accumulator for this step
+            await self.grpc_server.servicer.clear_gradients(step)
+
+            # 9. Update gRPC server's parameter store with our updated parameters
+            for name, param in self.model.named_parameters():
+                if self._get_param_owner_rank(name) == self.rank:
+                    self.grpc_server.update_parameters(name, param.data)
 
             # Calculate throughput
             step_time = time.time() - step_start
@@ -384,7 +493,7 @@ class DistributedTrainer:
 
                 await self.telemetry_reporter.report_step_async(
                     step=step,
-                    loss=loss,
+                    loss=loss.item() if isinstance(loss, torch.Tensor) else loss,
                     throughput=throughput,
                     memory_usage_gb=memory_usage
                 )
@@ -395,13 +504,32 @@ class DistributedTrainer:
                 elapsed = time.time() - start_time
                 steps_per_sec = (step + 1) / elapsed if elapsed > 0 else 0.0
 
+                # Communication overhead
+                comm_time = all_gather_time + reduce_scatter_time + grad_retrieval_time
+                compute_time = forward_time + backward_time + optimizer_time
+                total_time = comm_time + compute_time
+                comm_overhead = (comm_time / total_time * 100) if total_time > 0 else 0
+
                 logger.info(
                     f"Rank {self.rank} | "
                     f"Step {step+1:3d}/{num_steps} | "
-                    f"Loss: {loss:.4f} | "
-                    f"Avg Loss: {avg_loss:.4f} | "
-                    f"Speed: {steps_per_sec:.2f} steps/s"
+                    f"Loss: {loss.item():.4f} | "
+                    f"Avg: {avg_loss:.4f} | "
+                    f"Speed: {steps_per_sec:.2f} steps/s | "
+                    f"Comm: {comm_overhead:.1f}%"
                 )
+
+                # Detailed timing on first step and every 50 steps
+                if step == 0 or (step + 1) % 50 == 0:
+                    logger.info(
+                        f"  Timing breakdown: "
+                        f"all-gather={all_gather_time*1000:.1f}ms, "
+                        f"forward={forward_time*1000:.1f}ms, "
+                        f"backward={backward_time*1000:.1f}ms, "
+                        f"reduce-scatter={reduce_scatter_time*1000:.1f}ms, "
+                        f"grad-retrieval={grad_retrieval_time*1000:.1f}ms, "
+                        f"optimizer={optimizer_time*1000:.1f}ms"
+                    )
 
             # Save checkpoint
             if self.shard_manager and (step + 1) % checkpoint_interval == 0:
@@ -433,6 +561,23 @@ class DistributedTrainer:
             f"Rank {self.rank}: {num_steps} steps in {total_time:.2f}s "
             f"({results['steps_per_sec']:.2f} steps/s)"
         )
+
+        # Distributed barrier: wait for all workers to finish training
+        if self.coordinator_client:
+            logger.info(f"Rank {self.rank} finished training, waiting at barrier...")
+            barrier_success = await self.coordinator_client.wait_at_barrier(
+                step="training_complete",
+                poll_interval=1.0,
+                timeout=300.0  # 5 minutes
+            )
+            if barrier_success:
+                logger.info(f"Rank {self.rank} barrier complete, all workers finished")
+            else:
+                logger.warning(f"Rank {self.rank} barrier timeout")
+        else:
+            # Fallback if no coordinator
+            logger.info(f"Rank {self.rank} finished, waiting 10s for peers...")
+            await asyncio.sleep(10)
 
         return results
 
@@ -469,3 +614,27 @@ class DistributedTrainer:
             True if setup complete, False otherwise
         """
         return self._setup_complete
+
+    def _get_param_owner_rank(self, param_name: str) -> int:
+        """
+        Determine which worker owns a parameter.
+
+        In ZeRO-3, each parameter is owned by exactly one worker based on
+        the parameter partitioning.
+
+        Args:
+            param_name: Name of the parameter
+
+        Returns:
+            Rank of the worker that owns this parameter
+        """
+        if not self.partitioner:
+            return 0
+
+        for rank, partition in enumerate(self.partitioner.partitions):
+            if param_name in partition.param_names:
+                return rank
+
+        # Fallback: if parameter not found in any partition, assign to rank 0
+        logger.warning(f"Parameter {param_name} not found in any partition, assigning to rank 0")
+        return 0

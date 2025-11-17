@@ -152,28 +152,29 @@ class WorkerServicer(worker_pb2_grpc.WorkerServiceServicer):
             # Accumulate gradients with proper synchronization
             async with self.gradient_lock:
                 step = request.step
-                shard_id = f"{request.shard_start}_{request.shard_end}"
+                # Use parameter name from the tensor
+                param_name = request.gradients.name if request.gradients.name else f"shard_{request.shard_start}_{request.shard_end}"
 
                 # Initialize step accumulator if needed
                 if step not in self.gradient_accumulator:
                     self.gradient_accumulator[step] = {}
 
-                # Initialize shard accumulator if needed
-                if shard_id not in self.gradient_accumulator[step]:
-                    self.gradient_accumulator[step][shard_id] = []
+                # Initialize parameter accumulator if needed
+                if param_name not in self.gradient_accumulator[step]:
+                    self.gradient_accumulator[step][param_name] = []
 
                 # Add this worker's gradient contribution
-                self.gradient_accumulator[step][shard_id].append({
+                self.gradient_accumulator[step][param_name].append({
                     'sender_id': request.sender_id,
                     'gradients': gradients,
                     'timestamp': time.time()
                 })
 
-                num_contributions = len(self.gradient_accumulator[step][shard_id])
+                num_contributions = len(self.gradient_accumulator[step][param_name])
 
                 logger.debug(
                     f"Accumulated gradient {num_contributions} for step {step}, "
-                    f"shard {shard_id}"
+                    f"param {param_name}, shape {gradients.shape}"
                 )
 
             # Acknowledge

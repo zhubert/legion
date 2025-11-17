@@ -77,6 +77,58 @@ class CoordinatorClient:
             self._client = httpx.AsyncClient(timeout=self.timeout)
         return self._client
 
+    async def wait_at_barrier(
+        self,
+        step: str = "training_complete",
+        poll_interval: float = 1.0,
+        timeout: float = 300.0
+    ) -> bool:
+        """
+        Wait at a distributed barrier until all workers reach it.
+
+        Args:
+            step: Barrier step name
+            poll_interval: How often to poll in seconds
+            timeout: Maximum time to wait in seconds
+
+        Returns:
+            True if barrier completed, False if timeout
+        """
+        import asyncio
+        elapsed = 0.0
+
+        while elapsed < timeout:
+            try:
+                response = await self._request_with_retry(
+                    "POST",
+                    "/training/barrier",
+                    params={"worker_id": self.worker_id, "step": step}
+                )
+
+                data = response.json()
+
+                if data and data.get("all_ready"):
+                    logger.info(f"Barrier '{step}' complete - all workers ready")
+                    return True
+
+                reached = data.get("reached", 0)
+                total = data.get("total", 0)
+                waiting = data.get("waiting_for", [])
+
+                logger.debug(
+                    f"Barrier '{step}': {reached}/{total} workers ready, "
+                    f"waiting for: {waiting}"
+                )
+
+            except Exception as e:
+                logger.warning(f"Barrier check failed: {e}")
+
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+        logger.error(f"Barrier '{step}' timeout after {timeout}s")
+        return False
+
     async def close(self):
         """Close HTTP client."""
         if self._client is not None:

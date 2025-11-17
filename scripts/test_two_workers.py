@@ -97,6 +97,7 @@ async def run_worker(worker_id: str, port: int, num_steps: int = 50):
     config = WorkerConfig(
         worker_id=worker_id,
         coordinator_url="http://localhost:8000",
+        ip_address="127.0.0.1",  # Force localhost for local testing
         port=port,
         model_size="tiny",
         num_steps=num_steps,
@@ -122,6 +123,10 @@ async def run_worker(worker_id: str, port: int, num_steps: int = 50):
         if not await wait_for_training_ready(min_workers=2):
             logger.error(f"Worker {worker_id} timeout waiting for peers")
             return None
+
+        # Extra wait to ensure all gRPC servers are fully up
+        logger.info(f"Worker {worker_id} waiting for peer gRPC servers to be ready...")
+        await asyncio.sleep(2)
 
         # Run distributed training
         logger.info(f"Worker {worker_id} starting distributed training...")
