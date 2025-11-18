@@ -22,7 +22,7 @@ from worker.coordinator_client import CoordinatorClient
 
 from communication.grpc_server import WorkerGRPCServer
 from communication.grpc_client import WorkerGRPCClient
-from communication.grpc_collectives import GRPCCollectiveOps
+from communication.async_collectives import AsyncParameterFetcher, AsyncGradientPusher
 
 
 logger = logging.getLogger(__name__)
@@ -94,12 +94,16 @@ class DistributedTrainer:
         self.model: Optional[nn.Module] = None
         self.partitioner: Optional[Partitioner] = None
         self.collective_coordinator: Optional[CollectiveCoordinator] = None
-        self.grpc_collective_ops: Optional[GRPCCollectiveOps] = None
         self.worker_coordinator: Optional[WorkerCoordinator] = None
+        self.async_param_fetcher: Optional[AsyncParameterFetcher] = None
+        self.async_grad_pusher: Optional[AsyncGradientPusher] = None
 
         # Training state
         self._setup_complete = False
         self._current_step = 0
+
+        # Async parameter server config
+        self.staleness_bound = 5  # Maximum allowed version divergence
 
         logger.info(
             f"Distributed trainer initialized: worker_id={worker_id}, "
@@ -132,28 +136,29 @@ class DistributedTrainer:
         max_tensor_size = max(p.num_params for p in self.partitioner.partitions)
 
         if self.use_grpc:
-            # Use gRPC-based collectives for real distributed training
-            logger.info("Using gRPC-based collective operations")
-            self.grpc_collective_ops = GRPCCollectiveOps(
-                rank=self.rank,
-                world_size=self.world_size,
-                worker_id=self.worker_id,
-                worker_addresses=self.worker_addresses,
-                grpc_client=self.grpc_client,
-                timeout=30.0
+            # Use async parameter server for distributed training
+            logger.info("Using async parameter server architecture")
+
+            # Initialize async parameter fetcher and gradient pusher
+            self.async_param_fetcher = AsyncParameterFetcher(
+                self.grpc_client,
+                timeout=10.0,
+                enable_cache=True
             )
+            self.async_grad_pusher = AsyncGradientPusher(
+                self.grpc_client,
+                timeout=10.0,
+                max_retries=3
+            )
+            logger.info("Async parameter server components initialized")
 
-            # Update gRPC server's parameter store with owned parameters
+            # Configure gRPC server for version-tracked gradient accumulation
             if self.grpc_server:
-                # Set expected gradient count (world_size - 1, excluding self)
-                self.grpc_server.servicer.set_expected_gradient_count(self.world_size - 1)
-                logger.info(f"gRPC server expects {self.world_size - 1} gradient contributions per step")
+                self.grpc_server.servicer.set_world_size(self.world_size)
+                self.grpc_server.servicer.set_aggregation_threshold(0.75)  # 75% threshold
+                logger.info(f"gRPC server configured: world_size={self.world_size}, threshold=75%")
 
-                # We'll populate parameter store during training as parameters are updated
-                logger.info("gRPC server parameter store ready for updates")
-
-            # For gRPC mode, we still need a collective coordinator for the worker coordinator
-            # but we'll override the collective ops with gRPC-based ones
+            # For gRPC mode, we still need a collective coordinator for simulation compatibility
             self.collective_coordinator = CollectiveCoordinator(
                 self.world_size,
                 max_tensor_size
@@ -217,8 +222,8 @@ class DistributedTrainer:
 
         # Choose training path based on whether we're using gRPC
         if self.use_grpc:
-            # Real distributed training with gRPC
-            results = await self._train_distributed_grpc(dataset, num_steps, checkpoint_interval)
+            # Real distributed training with async parameter server
+            results = await self._train_async_parameter_server(dataset, num_steps, checkpoint_interval)
         else:
             # Simulation-based training (single-process multi-worker)
             results = await self._train_simulation(dataset, num_steps, checkpoint_interval)
@@ -317,18 +322,22 @@ class DistributedTrainer:
 
         return results
 
-    async def _train_distributed_grpc(
+    async def _train_async_parameter_server(
         self,
         dataset: List[Tuple[torch.Tensor, torch.Tensor]],
         num_steps: int,
         checkpoint_interval: int
     ) -> Dict[str, Any]:
         """
-        Training loop using gRPC-based distributed collectives.
+        Training loop using async parameter server architecture.
 
-        Each worker runs independently and coordinates via gRPC.
+        Key features:
+        - Bounded staleness: Workers limited to K steps ahead of global median
+        - Async parameter fetching: Parallel requests with cache fallback
+        - Async gradient pushing: Non-blocking with retry
+        - Work stealing: Fast workers help slow workers when ahead
         """
-        logger.info(f"Starting gRPC distributed training: rank {self.rank}/{self.world_size}")
+        logger.info(f"Starting async parameter server training: rank {self.rank}/{self.world_size}")
 
         losses = []
         start_time = time.time()
@@ -343,11 +352,21 @@ class DistributedTrainer:
 
         logger.info(f"Worker owns {len(owned_params)} parameter groups")
 
-        # Create optimizer for owned parameters
-        optimizer = torch.optim.Adam(
-            [p for p in self.model.parameters() if p.requires_grad],
-            lr=self.learning_rate
-        )
+        # Create optimizer for owned parameters only (ZeRO-3)
+        owned_param_objects = [
+            dict(self.model.named_parameters())[name]
+            for name in self.partitioner.partitions[self.rank].param_names
+            if name in dict(self.model.named_parameters())
+        ]
+        optimizer = torch.optim.Adam(owned_param_objects, lr=self.learning_rate)
+        logger.info(f"Optimizer tracking {len(owned_param_objects)} owned parameters")
+
+        # Build parameter ownership map (param_name -> owner_address)
+        param_owners = {}
+        for rank, partition in enumerate(self.partitioner.partitions):
+            owner_address = self.worker_addresses[rank]
+            for param_name in partition.param_names:
+                param_owners[param_name] = owner_address
 
         for step, (inputs, targets) in enumerate(dataset[:num_steps]):
             step_start = time.time()
@@ -356,126 +375,130 @@ class DistributedTrainer:
             inputs = inputs.to(self.device)
             targets = targets.to(self.device)
 
-            # === PHASE 1: Real Distributed Training with gRPC ===
+            # === PHASE 1: Check bounded staleness and get backup assignment ===
+            if self.coordinator_client:
+                # Report current version to coordinator
+                version_response = await self.coordinator_client.http_client.post(
+                    f"{self.coordinator_client.base_url}/training/version/update",
+                    json={
+                        "worker_id": self.worker_id,
+                        "version": step,
+                        "is_healthy": True
+                    }
+                )
+                version_data = version_response.json()
+                global_version = version_data.get("global_version", 0)
+                is_ahead = version_data.get("is_ahead", False)
+                backup_assignment = version_data.get("backup_assignment")
 
-            # 1. All-gather parameters from all workers via gRPC
-            all_gather_start = time.time()
-            all_params = {}
+                if is_ahead and backup_assignment:
+                    logger.info(
+                        f"Step {step}: Worker ahead (v{step} > v{global_version}+{self.staleness_bound}), "
+                        f"assigned to help {backup_assignment}"
+                    )
+                    # Work stealing: Compute backup gradients for slow worker
+                    await self._compute_backup_gradients(
+                        backup_worker_id=backup_assignment,
+                        backup_version=global_version,
+                        inputs=inputs,
+                        targets=targets,
+                        param_owners=param_owners
+                    )
+                    # Skip own training step when doing backup computation
+                    logger.info(f"Step {step}: Completed backup computation for {backup_assignment}")
+                    continue
+            else:
+                is_ahead = False
+                backup_assignment = None
 
-            for name, param in self.model.named_parameters():
-                param_owner_rank = self._get_param_owner_rank(name)
+            # === PHASE 2: Async parameter fetching ===
+            fetch_start = time.time()
 
-                if param_owner_rank == self.rank:
-                    # We own this parameter, use our local copy
-                    all_params[name] = param.data.clone()
-                else:
-                    # Fetch from the owner via gRPC with retry
-                    fetched = None
-                    for retry in range(3):
-                        fetched = await self.grpc_client.get_parameters(
-                            worker_address=self.worker_addresses[param_owner_rank],
-                            parameter_name=name,
-                            shard_start=0,
-                            shard_end=-1
-                        )
-                        if fetched is not None:
-                            break
-                        # Wait before retry (peer might still be starting up)
-                        if retry < 2:
-                            await asyncio.sleep(0.5)
+            # Build parameter fetch requests (address, param_name, shard_start, shard_end)
+            parameter_requests = []
+            for param_name in self.model.state_dict().keys():
+                if param_name in param_owners:
+                    owner_address = param_owners[param_name]
+                    # For now, fetch full parameter (shard_start=0, shard_end=-1)
+                    parameter_requests.append((owner_address, param_name, 0, -1))
 
-                    if fetched is not None:
-                        all_params[name] = fetched
-                    else:
-                        # Fallback: use current parameter value
-                        logger.warning(f"Failed to fetch {name} from rank {param_owner_rank} after retries, using local")
-                        all_params[name] = param.data.clone()
+            # Fetch all parameters in parallel
+            fetched_params = await self.async_param_fetcher.fetch_parameters_async(
+                parameter_requests,
+                version=step,
+                staleness_tolerance=self.staleness_bound
+            )
 
-            all_gather_time = time.time() - all_gather_start
+            fetch_time = time.time() - fetch_start
 
-            # 2. Load all parameters into model for forward/backward
+            # === PHASE 3: Load parameters into model ===
+            load_start = time.time()
             with torch.no_grad():
-                for name, param in self.model.named_parameters():
-                    param.data.copy_(all_params[name])
+                for param_key, param_tensor in fetched_params.items():
+                    if param_tensor is not None:
+                        # Extract param name from key (format: "param_name[start:end]")
+                        param_name = param_key.split('[')[0]
+                        if param_name in dict(self.model.named_parameters()):
+                            self.model.state_dict()[param_name].copy_(param_tensor)
+            load_time = time.time() - load_start
 
-            # 3. Forward pass
+            # === PHASE 4: Forward pass ===
             forward_start = time.time()
             logits, loss = self.model(inputs, targets)
             losses.append(loss.item())
             forward_time = time.time() - forward_start
 
-            # 4. Backward pass to compute gradients
+            # === PHASE 5: Backward pass ===
             backward_start = time.time()
             optimizer.zero_grad()
             loss.backward()
             backward_time = time.time() - backward_start
 
-            # 5. Reduce-scatter: Send gradients to parameter owners via gRPC
-            reduce_scatter_start = time.time()
+            # === PHASE 6: Async gradient pushing ===
+            push_start = time.time()
 
-            for name, param in self.model.named_parameters():
-                if param.grad is None:
-                    continue
+            # Build gradient push requests (address, param_name, gradient, shard_start, shard_end)
+            gradient_requests = []
+            for param_name, param in self.model.named_parameters():
+                if param.grad is not None and param_name in param_owners:
+                    owner_address = param_owners[param_name]
+                    gradient_requests.append((owner_address, param_name, param.grad, 0, -1))
 
-                param_owner_rank = self._get_param_owner_rank(name)
+            # Push all gradients in parallel (non-blocking)
+            push_results = await self.async_grad_pusher.push_gradients_async(
+                gradient_requests,
+                version=step
+            )
 
-                if param_owner_rank != self.rank:
-                    # Send our gradient to the owner with retry
-                    success = False
-                    for retry in range(3):
-                        success = await self.grpc_client.send_gradients(
-                            worker_address=self.worker_addresses[param_owner_rank],
-                            gradients=param.grad,
-                            step=step,
-                            parameter_name=name,  # Pass parameter name for proper accumulation
-                            shard_start=0,
-                            shard_end=-1
-                        )
-                        if success:
-                            break
-                        if retry < 2:
-                            await asyncio.sleep(0.1)
+            push_time = time.time() - push_start
 
-                    if not success:
-                        logger.warning(f"Failed to send gradient for {name} to rank {param_owner_rank}")
+            # === PHASE 7: Wait for gradient aggregation and fetch reduced gradients ===
+            # For owned parameters, wait for aggregation threshold then retrieve
+            aggregation_start = time.time()
 
-            reduce_scatter_time = time.time() - reduce_scatter_start
-
-            # 6. Retrieve accumulated gradients for parameters we own
-            grad_retrieval_start = time.time()
-
-            for name, param in self.model.named_parameters():
-                if param.grad is None:
-                    continue
-
-                param_owner_rank = self._get_param_owner_rank(name)
-
-                if param_owner_rank == self.rank:
-                    # We own this parameter - get accumulated gradients from other workers
-                    # Wait briefly for gradients to arrive
-                    await asyncio.sleep(0.01)
-
-                    accumulated_grad = await self.grpc_server.servicer.get_accumulated_gradients(
-                        step=step,
-                        shard_id=name,  # Use parameter name
-                        reduce_op="sum"
+            for param_name in self.partitioner.partitions[self.rank].param_names:
+                if param_name in dict(self.model.named_parameters()):
+                    # Wait for aggregation (threshold-based, not 100%)
+                    aggregated_grad = await self.grpc_server.servicer.get_accumulated_gradients(
+                        version=step,
+                        param_name=param_name,
+                        wait_for_threshold=True,
+                        timeout=30.0
                     )
 
-                    if accumulated_grad is not None:
-                        # Add accumulated gradients from other workers to our own gradient
-                        param.grad.data.add_(accumulated_grad)
+                    if aggregated_grad is not None:
+                        # Apply aggregated gradient to parameter
+                        param = dict(self.model.named_parameters())[param_name]
+                        param.grad = aggregated_grad
 
-            grad_retrieval_time = time.time() - grad_retrieval_start
+            aggregation_time = time.time() - aggregation_start
 
-            # 7. Optimizer step (only updates parameters we own)
+            # === PHASE 8: Optimizer step (only owned parameters) ===
             optimizer_start = time.time()
             optimizer.step()
             optimizer_time = time.time() - optimizer_start
 
-            # 8. Clear gradient accumulator for this step
-            await self.grpc_server.servicer.clear_gradients(step)
-
-            # 9. Update gRPC server's parameter store with our updated parameters
+            # === PHASE 9: Update parameter server with new values ===
             for name, param in self.model.named_parameters():
                 if self._get_param_owner_rank(name) == self.rank:
                     self.grpc_server.update_parameters(name, param.data)
@@ -505,8 +528,8 @@ class DistributedTrainer:
                 steps_per_sec = (step + 1) / elapsed if elapsed > 0 else 0.0
 
                 # Communication overhead
-                comm_time = all_gather_time + reduce_scatter_time + grad_retrieval_time
-                compute_time = forward_time + backward_time + optimizer_time
+                comm_time = fetch_time + push_time + aggregation_time
+                compute_time = forward_time + backward_time + optimizer_time + load_time
                 total_time = comm_time + compute_time
                 comm_overhead = (comm_time / total_time * 100) if total_time > 0 else 0
 
@@ -523,11 +546,12 @@ class DistributedTrainer:
                 if step == 0 or (step + 1) % 50 == 0:
                     logger.info(
                         f"  Timing breakdown: "
-                        f"all-gather={all_gather_time*1000:.1f}ms, "
+                        f"fetch={fetch_time*1000:.1f}ms, "
+                        f"load={load_time*1000:.1f}ms, "
                         f"forward={forward_time*1000:.1f}ms, "
                         f"backward={backward_time*1000:.1f}ms, "
-                        f"reduce-scatter={reduce_scatter_time*1000:.1f}ms, "
-                        f"grad-retrieval={grad_retrieval_time*1000:.1f}ms, "
+                        f"push={push_time*1000:.1f}ms, "
+                        f"aggregation={aggregation_time*1000:.1f}ms, "
                         f"optimizer={optimizer_time*1000:.1f}ms"
                     )
 
@@ -557,7 +581,7 @@ class DistributedTrainer:
         }
 
         logger.info(
-            f"Distributed training complete! "
+            f"Async PS training complete! "
             f"Rank {self.rank}: {num_steps} steps in {total_time:.2f}s "
             f"({results['steps_per_sec']:.2f} steps/s)"
         )
@@ -567,7 +591,7 @@ class DistributedTrainer:
             logger.info(f"Rank {self.rank} finished training, waiting at barrier...")
             barrier_success = await self.coordinator_client.wait_at_barrier(
                 step="training_complete",
-                poll_interval=1.0,
+                poll_interval=5.0,
                 timeout=300.0  # 5 minutes
             )
             if barrier_success:
@@ -580,6 +604,91 @@ class DistributedTrainer:
             await asyncio.sleep(10)
 
         return results
+
+    async def _compute_backup_gradients(
+        self,
+        backup_worker_id: str,
+        backup_version: int,
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        param_owners: Dict[str, str]
+    ):
+        """
+        Compute backup gradients for a slow worker (work stealing).
+
+        When this worker is ahead of the staleness bound, it helps a slow worker
+        by fetching their older parameters, running forward/backward, and sending
+        gradients to help them catch up.
+
+        Args:
+            backup_worker_id: ID of slow worker to help
+            backup_version: Version/step of slow worker to compute for
+            inputs: Input batch
+            targets: Target batch
+            param_owners: Map of param_name -> owner_address
+        """
+        logger.info(f"Computing backup gradients for {backup_worker_id} at version {backup_version}")
+
+        try:
+            # 1. Fetch parameters at the slow worker's version
+            # Note: We fetch from current parameter owners, but ideally should fetch
+            # parameters as they were at backup_version (future enhancement)
+            parameter_requests = []
+            for param_name in self.model.state_dict().keys():
+                if param_name in param_owners:
+                    owner_address = param_owners[param_name]
+                    parameter_requests.append((owner_address, param_name, 0, -1))
+
+            fetched_params = await self.async_param_fetcher.fetch_parameters_async(
+                parameter_requests,
+                version=backup_version,
+                staleness_tolerance=self.staleness_bound
+            )
+
+            # 2. Load parameters into model
+            with torch.no_grad():
+                for param_key, param_tensor in fetched_params.items():
+                    if param_tensor is not None:
+                        param_name = param_key.split('[')[0]
+                        if param_name in dict(self.model.named_parameters()):
+                            self.model.state_dict()[param_name].copy_(param_tensor)
+
+            # 3. Forward pass with slow worker's batch (we use our own batch as proxy)
+            # TODO: Ideally fetch the slow worker's actual batch for this version
+            logits, loss = self.model(inputs, targets)
+            logger.debug(f"Backup computation loss: {loss.item():.4f}")
+
+            # 4. Backward pass to compute backup gradients
+            # Clear gradients first
+            for param in self.model.parameters():
+                if param.grad is not None:
+                    param.grad.zero_()
+
+            loss.backward()
+
+            # 5. Send backup gradients to parameter owners
+            # Tag these as backup gradients for the slow worker's version
+            gradient_requests = []
+            for param_name, param in self.model.named_parameters():
+                if param.grad is not None and param_name in param_owners:
+                    owner_address = param_owners[param_name]
+                    gradient_requests.append((owner_address, param_name, param.grad, 0, -1))
+
+            # Push backup gradients with the slow worker's version
+            push_results = await self.async_grad_pusher.push_gradients_async(
+                gradient_requests,
+                version=backup_version
+            )
+
+            # Count successful pushes
+            successful_pushes = sum(1 for success in push_results.values() if success)
+            logger.info(
+                f"Backup gradients sent: {successful_pushes}/{len(push_results)} successful "
+                f"for {backup_worker_id} v{backup_version}"
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to compute backup gradients for {backup_worker_id}: {e}")
 
     def get_worker_stats(self) -> Dict[str, Any]:
         """

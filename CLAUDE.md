@@ -49,7 +49,14 @@ Distributed training worker that coordinates with the coordinator and performs l
 - `worker/telemetry.py` - Metrics collection and reporting
 
 ### 4. Communication Layer (`communication/`)
-Handles worker-to-worker communication (gRPC implementation planned for Phase 1.3).
+Handles worker-to-worker communication via gRPC.
+
+**Key files:**
+- `communication/grpc_server.py` - gRPC server for serving parameters and accumulating gradients
+- `communication/grpc_client.py` - gRPC client for fetching parameters and sending gradients
+- `communication/grpc_collectives.py` - All-gather and reduce-scatter implementations
+- `communication/serialization.py` - Tensor serialization with chunking for large transfers
+- `communication/proto/` - Protocol buffer definitions
 
 ## Development Commands
 
@@ -104,15 +111,29 @@ python -m worker.client
 python -c "import asyncio; from worker.client import main; asyncio.run(main())"
 ```
 
-### Testing the Full System
+### Testing Distributed Training
+
+**2-Worker Test (Recommended):**
 ```bash
 # Terminal 1: Start coordinator
 python -m coordinator.server
 
-# Terminal 2: Start worker
+# Terminal 2: Run 2-worker test script
+python scripts/test_two_workers.py
+```
+
+**Manual Multi-Worker:**
+```bash
+# Terminal 1: Start coordinator
+python -m coordinator.server
+
+# Terminal 2: Start worker 1
 python -m worker.client
 
-# Terminal 3: Check status
+# Terminal 3: Start worker 2
+python -m worker.client
+
+# Terminal 4: Check status
 curl http://localhost:8000/health
 curl http://localhost:8000/workers
 ```
@@ -163,7 +184,8 @@ The project has comprehensive tests across all components:
 
 - **Unit tests**: `tests/test_*.py` - Test individual components
 - **Integration tests**: `tests/integration/` - Test component interactions
-- **Current coverage**: 37 passing tests for Phase 0
+- **End-to-end tests**: `scripts/test_two_workers.py` - Full distributed training
+- **Current coverage**: 164 passing tests, 4 skipped
 
 When adding new features:
 1. Write unit tests for new components
@@ -189,17 +211,22 @@ Following the author's style guide (STYLEGUIDE.md):
 - ✅ Network latency simulation
 - ✅ End-to-end training test
 
-**In Progress (Phase 1)**:
-- 🚧 Coordinator server (functional, needs testing)
-- 🚧 Worker client (functional, single-worker mode)
-- 🚧 gRPC communication layer (planned Phase 1.3)
-- 🚧 Integration tests for multi-machine setup
+**Completed (Phase 1.3)**:
+- ✅ Coordinator server with REST + WebSocket
+- ✅ Worker client with heartbeat and telemetry
+- ✅ gRPC worker-to-worker communication
+- ✅ Real distributed training with ZeRO-3
+- ✅ Multi-worker integration tests (2+ workers)
+- ✅ Gradient accumulation across workers
+- ✅ Parameter synchronization via gRPC
+- ✅ Training barriers and synchronization
 
-**Next Steps**:
-1. Complete gRPC communication implementation
-2. Multi-worker distributed training (2-4 workers)
+**Next Steps (Phase 2)**:
+1. Add gradient compression to gRPC transfers (INT8)
+2. Implement ring-based collectives for bandwidth efficiency
 3. Latency measurement and regional clustering
 4. Fault tolerance testing (worker dropout/rejoin)
+5. Scale to 4-8 workers for production testing
 
 ## Common Pitfalls
 
@@ -221,7 +248,7 @@ Core stack:
 - **httpx**: Async HTTP client for workers
 - **pytest**: Testing framework
 
-Planned (Phase 1.3):
+Communication:
 - **gRPC**: Worker-to-worker communication
 - **protobuf**: Tensor serialization
 

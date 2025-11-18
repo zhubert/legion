@@ -91,26 +91,35 @@ def train_distributed(
 
     print(f"  Created {world_size} workers")
 
-    # 5. Create dataset
-    print(f"\nGenerating dataset ({num_steps} batches)...")
-    dataset = create_dummy_dataset(
-        vocab_size=vocab_size,
-        seq_len=seq_len,
-        num_batches=num_steps,
-        batch_size=batch_size
-    )
+    # 5. Create distributed datasets (one per worker)
+    print(f"\nGenerating distributed datasets ({num_steps} batches per worker)...")
+    from core.dataset import create_distributed_dataset
+
+    # Create separate dataset for each worker with proper data parallelism
+    worker_datasets = []
+    for rank in range(world_size):
+        worker_dataset = create_distributed_dataset(
+            vocab_size=vocab_size,
+            seq_len=seq_len,
+            num_batches=num_steps,
+            batch_size=batch_size,
+            rank=rank,
+            world_size=world_size,
+            seed=42  # Same seed ensures coordinated but non-overlapping data
+        )
+        worker_datasets.append(worker_dataset)
+
+    print(f"  Each worker has {len(worker_datasets[0])} batches")
+    print(f"  Global effective batch size: {batch_size * world_size}")
 
     # 6. Training loop
     print(f"\nStarting training...\n")
     start_time = time.time()
 
     losses = []
-    for step, batch in enumerate(dataset):
-        # Simulation mode: All workers get the same batch for simplicity.
-        # In real distributed training, each worker loads different data from
-        # its sharded dataset (see worker/client.py and core/dataset.py for
-        # create_distributed_dataset() which implements proper data parallelism).
-        batches = [batch for _ in range(world_size)]
+    for step in range(num_steps):
+        # Each worker gets its own data shard for this step
+        batches = [worker_datasets[rank][step] for rank in range(world_size)]
 
         # Execute training step
         metrics = worker_coordinator.train_step(batches)

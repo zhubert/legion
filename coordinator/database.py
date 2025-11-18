@@ -112,6 +112,19 @@ class Database:
             )
         """)
 
+        # Barriers table for persistent barrier state
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS barriers (
+                barrier_id TEXT PRIMARY KEY,
+                step TEXT NOT NULL,
+                worker_ids TEXT NOT NULL,
+                arrived_workers TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL,
+                updated_at TIMESTAMP NOT NULL
+            )
+        """)
+
         conn.commit()
 
     # Worker operations
@@ -579,6 +592,140 @@ class Database:
         """, (limit,))
 
         return [dict(row) for row in cursor.fetchall()]
+
+    # Barrier operations
+
+    def create_or_update_barrier(
+        self,
+        barrier_id: str,
+        step: str,
+        worker_ids: List[str],
+        arrived_workers: List[str],
+        status: str = "waiting"
+    ) -> bool:
+        """
+        Create or update a barrier state.
+
+        Args:
+            barrier_id: Unique barrier identifier
+            step: Barrier step name (e.g., "training_complete")
+            worker_ids: List of worker IDs expected at this barrier
+            arrived_workers: List of worker IDs that have arrived
+            status: Barrier status ("waiting", "complete", "timeout")
+
+        Returns:
+            True if successful, False otherwise
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        try:
+            now = datetime.now(UTC)
+
+            cursor.execute("""
+                INSERT INTO barriers (
+                    barrier_id, step, worker_ids, arrived_workers, status,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(barrier_id) DO UPDATE SET
+                    worker_ids = excluded.worker_ids,
+                    arrived_workers = excluded.arrived_workers,
+                    status = excluded.status,
+                    updated_at = excluded.updated_at
+            """, (
+                barrier_id,
+                step,
+                json.dumps(worker_ids),
+                json.dumps(arrived_workers),
+                status,
+                now,
+                now
+            ))
+
+            conn.commit()
+            return True
+        except Exception as e:
+            conn.rollback()
+            return False
+
+    def get_barrier(self, barrier_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get barrier state.
+
+        Args:
+            barrier_id: Unique barrier identifier
+
+        Returns:
+            Barrier dictionary or None if not found
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT * FROM barriers
+            WHERE barrier_id = ?
+        """, (barrier_id,))
+
+        row = cursor.fetchone()
+        if row:
+            barrier = dict(row)
+            # Parse JSON fields
+            barrier['worker_ids'] = json.loads(barrier['worker_ids'])
+            barrier['arrived_workers'] = json.loads(barrier['arrived_workers'])
+            return barrier
+        return None
+
+    def delete_barrier(self, barrier_id: str) -> bool:
+        """
+        Delete a barrier.
+
+        Args:
+            barrier_id: Unique barrier identifier
+
+        Returns:
+            True if deleted, False otherwise
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute("""
+                DELETE FROM barriers WHERE barrier_id = ?
+            """, (barrier_id,))
+
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            return False
+
+    def cleanup_old_barriers(self, max_age_seconds: int = 3600) -> int:
+        """
+        Clean up old barriers (older than max_age_seconds).
+
+        Args:
+            max_age_seconds: Maximum age in seconds (default: 1 hour)
+
+        Returns:
+            Number of barriers deleted
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        try:
+            cutoff_time = datetime.now(UTC).timestamp() - max_age_seconds
+
+            cursor.execute("""
+                DELETE FROM barriers
+                WHERE strftime('%s', updated_at) < ?
+            """, (cutoff_time,))
+
+            deleted = cursor.rowcount
+            conn.commit()
+            return deleted
+        except Exception:
+            conn.rollback()
+            return 0
 
     def close(self):
         """Close database connection."""

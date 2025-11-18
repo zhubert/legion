@@ -90,12 +90,13 @@ class TestGRPCServerClient:
         param_tensor = torch.randn(100, 100)
         param_store = {"model.weight": param_tensor}
 
-        # Start server
+        # Start server (disable compression for exact comparison test)
         server = WorkerGRPCServer(
             worker_id="worker_0",
             parameter_store=param_store,
             host="127.0.0.1",
             port=50052,
+            enable_compression=False,  # Disable for exact match test
         )
         await server.start()
 
@@ -103,8 +104,8 @@ class TestGRPCServerClient:
             # Give server time to start
             await asyncio.sleep(0.2)
 
-            # Create client
-            client = WorkerGRPCClient(worker_id="worker_1")
+            # Create client (disable compression to match server)
+            client = WorkerGRPCClient(worker_id="worker_1", enable_compression=False)
 
             # Request parameter
             fetched = await client.get_parameters(
@@ -112,9 +113,60 @@ class TestGRPCServerClient:
                 parameter_name="model.weight",
             )
 
-            # Verify
+            # Verify (compression is OFF, should be exact)
             assert fetched is not None
             assert torch.allclose(param_tensor, fetched)
+
+            await client.close()
+
+        finally:
+            await server.stop(grace=1.0)
+
+    async def test_parameter_transfer_with_compression(self):
+        """Test parameter transfer with INT8 compression enabled."""
+        # Create a parameter to serve
+        param_tensor = torch.randn(100, 100)
+        param_store = {"model.weight": param_tensor}
+
+        # Start server with compression enabled
+        server = WorkerGRPCServer(
+            worker_id="worker_0",
+            parameter_store=param_store,
+            host="127.0.0.1",
+            port=50053,
+            enable_compression=True,  # Enable compression
+        )
+        await server.start()
+
+        try:
+            # Give server time to start
+            await asyncio.sleep(0.2)
+
+            # Create client with compression enabled
+            client = WorkerGRPCClient(worker_id="worker_1", enable_compression=True)
+
+            # Request parameter
+            fetched = await client.get_parameters(
+                worker_address="127.0.0.1:50053",
+                parameter_name="model.weight",
+            )
+
+            # Verify reconstruction quality with INT8 compression
+            assert fetched is not None
+            # Verify shape is preserved
+            assert fetched.shape == param_tensor.shape
+
+            # Check compression error is reasonable
+            # INT8 quantization maps [-max, max] to [-127, 127]
+            # So max error per value is max/127 (about 0.8% for normal distribution)
+            max_abs_error = (param_tensor - fetched).abs().max().item()
+            relative_error = max_abs_error / param_tensor.abs().max().item()
+
+            # Expect relative error < 1% (1/127 ≈ 0.79%)
+            assert relative_error < 0.02, f"Compression error too large: {relative_error:.4f}"
+
+            # Most values should be very close
+            assert torch.allclose(param_tensor, fetched, rtol=0.05, atol=0.02)
 
             await client.close()
 
@@ -127,7 +179,7 @@ class TestGRPCServerClient:
             worker_id="worker_0",
             parameter_store={},
             host="127.0.0.1",
-            port=50053,
+            port=50054,
         )
         await server.start()
 
@@ -137,7 +189,7 @@ class TestGRPCServerClient:
             client = WorkerGRPCClient(worker_id="worker_1")
 
             # Ping server
-            latency = await client.ping("127.0.0.1:50053")
+            latency = await client.ping("127.0.0.1:50054")
 
             # Verify latency is reasonable (local should be <10ms)
             assert latency is not None

@@ -23,6 +23,9 @@ service WorkerService {
 
   // Ping for latency measurement
   rpc Ping(PingRequest) returns (PingResponse) {}
+
+  // Ring collective operations - send chunk to neighbor
+  rpc SendRingChunk(RingChunkRequest) returns (RingChunkAck) {}
 }
 
 // Request parameters from a worker
@@ -134,4 +137,40 @@ message PingRequest {
 message PingResponse {
   int64 timestamp = 1;
   int64 server_time = 2;
+}
+
+// Ring collective operations
+message RingChunkRequest {
+  // Worker ID sending the chunk
+  string sender_id = 1;
+
+  // Chunk data being sent around the ring
+  TensorProto chunk = 2;
+
+  // Ring operation details
+  string operation_id = 3;  // Unique ID for this collective operation
+  int32 step = 4;            // Current ring step (0 to world_size-1)
+  int32 rank = 5;            // Sender's rank
+
+  // Operation type
+  enum RingOp {
+    ALL_GATHER = 0;
+    REDUCE_SCATTER = 1;
+    ALL_REDUCE = 2;
+  }
+  RingOp operation = 6;
+
+  // For reduce operations
+  enum ReduceOp {
+    SUM = 0;
+    AVG = 1;
+    MAX = 2;
+    MIN = 3;
+  }
+  ReduceOp reduce_op = 7;
+}
+
+message RingChunkAck {
+  bool success = 1;
+  string message = 2;
 }

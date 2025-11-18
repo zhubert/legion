@@ -7,9 +7,10 @@ network transmission with support for compression.
 
 import torch
 import numpy as np
-from typing import Optional
+from typing import Optional, Tuple
 
 from communication.proto import tensor_pb2
+from core.compression import INT8Quantizer
 
 
 # Mapping between PyTorch dtypes and protobuf DType enum
@@ -243,3 +244,80 @@ def reassemble_chunks(chunks: list[tensor_pb2.TensorChunk]) -> torch.Tensor:
 
     # Copy to make writable before converting to PyTorch
     return torch.from_numpy(tensor_np.copy())
+
+
+def serialize_tensor_compressed(
+    tensor: torch.Tensor,
+    name: Optional[str] = None,
+    compress: bool = True
+) -> tensor_pb2.TensorProto:
+    """
+    Serialize tensor with optional INT8 compression.
+
+    Args:
+        tensor: PyTorch tensor to serialize
+        name: Optional identifier for the tensor
+        compress: Whether to apply INT8 compression (default: True)
+
+    Returns:
+        TensorProto message with compressed data if enabled
+    """
+    if not compress or tensor.dtype != torch.float32:
+        # No compression or already compressed dtype
+        return serialize_tensor(tensor, name=name)
+
+    # Compress with INT8 quantization
+    quantized, scale = INT8Quantizer.quantize(tensor)
+
+    # Create compression metadata
+    compression_info = create_compression_info(
+        compression_type="int8",
+        scale=scale.item(),
+        original_shape=tuple(tensor.shape),
+        original_dtype=tensor.dtype
+    )
+
+    # Serialize the quantized tensor
+    return serialize_tensor(quantized, name=name, compression_info=compression_info)
+
+
+def deserialize_tensor_compressed(
+    proto: tensor_pb2.TensorProto,
+    device: Optional[torch.device] = None
+) -> torch.Tensor:
+    """
+    Deserialize tensor and decompress if needed.
+
+    Args:
+        proto: TensorProto message from gRPC
+        device: Target device for the tensor
+
+    Returns:
+        Decompressed PyTorch tensor
+    """
+    # Check if compression was used
+    if proto.compression.type == tensor_pb2.CompressionInfo.NONE:
+        # No compression
+        return deserialize_tensor(proto, device=device)
+
+    elif proto.compression.type == tensor_pb2.CompressionInfo.INT8_QUANTIZE:
+        # INT8 compression - decompress
+        quantized = deserialize_tensor(proto, device=device)
+        scale = torch.tensor(proto.compression.scale)
+
+        # Dequantize
+        tensor = INT8Quantizer.dequantize(quantized, scale)
+
+        # Restore original shape if needed
+        if proto.compression.original_shape:
+            original_shape = tuple(proto.compression.original_shape)
+            tensor = tensor.view(original_shape)
+
+        # Move to target device
+        if device:
+            tensor = tensor.to(device)
+
+        return tensor
+
+    else:
+        raise ValueError(f"Unsupported compression type: {proto.compression.type}")

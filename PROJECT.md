@@ -549,42 +549,285 @@ if new_worker_joins():
 
 ---
 
-### Phase 2: ZeRO-3 Implementation (Week 5-6)
+### Phase 2: Asynchronous Parameter Server & Fault Tolerance (Week 5-8)
 
-**Goal:** Implement memory-efficient parameter partitioning
+**Goal:** Replace synchronous ring collectives with fault-tolerant asynchronous parameter server architecture
+
+**Motivation:**
+
+Ring collectives were designed for homogeneous datacenter hardware where:
+- All workers have similar compute speed (±10%)
+- Network latency is low and predictable (<1ms)
+- Worker failures are rare
+
+Legion operates in a fundamentally different environment:
+- **Extreme heterogeneity**: CPU vs GPU workers (50x speed difference)
+- **High latency networks**: 10-100ms consumer internet
+- **Frequent dropout**: Volunteers can disconnect at any time
+
+**Current Problem:**
+
+Ring collectives create a **synchronous barrier** where fast workers idle waiting for slow workers:
+
+```
+Training Step Timeline (4 workers):
+
+Worker 0 (GPU): |--10ms compute--|⏸️ WAIT 490ms ⏸️|--ring 40ms--|
+Worker 1 (GPU): |--10ms compute--|⏸️ WAIT 490ms ⏸️|--ring 40ms--|
+Worker 2 (CPU): |--------500ms compute--------|--ring 40ms--|
+Worker 3 (GPU): |--10ms compute--|⏸️ WAIT 490ms ⏸️|--ring 40ms--|
+
+GPU utilization: 10ms / 540ms = 1.85% 🔥
+```
+
+If any worker fails during the ring, the entire operation breaks.
+
+**Solution: Asynchronous Parameter Server**
+
+Each worker that owns a parameter shard becomes a parameter server for that shard. Workers fetch parameters and push gradients asynchronously without waiting for all workers to participate.
+
+**Key Innovations:**
+
+1. **Bounded Staleness:** Fast workers can get ahead by K steps, preventing unbounded divergence
+2. **Work Stealing:** Workers that are too far ahead help slower workers instead of idling
+3. **Graceful Degradation:** System continues with N-1 workers if one fails
+4. **Adaptive Aggregation:** Parameter servers aggregate when 50-90% of workers respond
 
 **Tasks:**
 
-- [ ] Parameter partitioning logic
-  - Shard model weights across workers
-  - Dynamic load balancing
-  - Handle heterogeneous worker capacity
-- [ ] All-gather with partitioning
-  - Collect parameters only when needed
-  - Layer-by-layer gathering
-  - Overlap with computation
-- [ ] Reduce-scatter with partitioning
-  - Route gradients to parameter owners
-  - Gradient accumulation
-  - Overlap with backward pass
-- [ ] CPU offloading (ZeRO-Offload)
-  - Optimizer states in CPU RAM
-  - GPU ↔ CPU transfers
-  - NVMe offload for extreme scale
+**1. Asynchronous Communication Primitives (Days 1-3)**
+
+- [ ] Implement async parameter fetch
+  - Parallel fetching from multiple parameter servers
+  - Timeout and fallback mechanisms
+  - Version-aware parameter requests
+  - Handle partial failures gracefully
+- [ ] Implement async gradient push
+  - Non-blocking gradient sends
+  - Compression-aware transfer
+  - Retry logic for transient failures
+- [ ] Resurrect gradient accumulator in `grpc_server.py`
+  - Version-tracked gradient buffering
+  - Adaptive aggregation threshold (50-90% of workers)
+  - Timeout-based aggregation (don't wait forever)
+  - Gradient replay for recovery
+
+**2. Version Management & Bounded Staleness (Days 4-6)**
+
+- [ ] Coordinator version tracking
+  - Track each worker's current training step
+  - Compute global version (median of active workers)
+  - Expose `/training/global_version` endpoint
+  - Broadcast version updates via WebSocket
+- [ ] Worker staleness bounds
+  - Check staleness before each training step
+  - Block if too far ahead (>K steps from global version)
+  - Request older parameters if too far behind
+  - Dynamic staleness bound based on cluster health
+- [ ] Version-aware parameter/gradient exchange
+  - Tag all messages with version numbers
+  - Parameter servers serve multiple versions
+  - Gradient aggregation per version
+  - Automatic cleanup of old versions
+
+**3. Work Stealing for Ahead Workers (Days 7-9)**
+
+- [ ] Backup computation system
+  - Detect when worker is ahead of staleness bound
+  - Query coordinator for slow/struggling workers
+  - Fetch slow worker's data batch
+  - Compute gradients at slow worker's version
+  - Push backup gradients to parameter servers
+- [ ] Coordinator work assignment
+  - Track slow workers (below median version)
+  - Assign backup computation to ahead workers
+  - Manage backup gradient pool
+  - Use backup gradients if original worker times out
+- [ ] Incentive tracking (future)
+  - Track compute contributions per worker
+  - Reward workers who compute backups
+  - Could enable future credit-based system
+
+**4. Fault Tolerance Mechanisms (Days 10-13)**
+
+- [ ] Gradient buffering and replay
+  - Parameter servers keep last 100 versions of gradients
+  - New/recovering workers request gradient replay
+  - Replay gradients from checkpoint version to current
+  - Catch up to cluster without restart
+- [ ] Ownership reassignment
+  - Coordinator detects worker failures (heartbeat timeout)
+  - Reassign parameter shards to healthy workers
+  - Broadcast ownership changes to all workers
+  - New owner loads shard from latest checkpoint
+- [ ] Distributed checkpoint coordination
+  - Version-based checkpointing (all workers checkpoint at version V)
+  - Coordinator triggers global checkpoints
+  - Workers report checkpoint completion
+  - Track checkpoint versions for recovery
+- [ ] Recovery procedures
+  - Worker crash detection via heartbeat
+  - Failed worker shard redistribution
+  - New worker joins and loads checkpoint
+  - Replays gradients to catch up
+
+**5. Heterogeneous Worker Support (Days 14-16)**
+
+- [ ] Worker capacity calibration
+  - Self-benchmark on startup (find optimal batch size)
+  - Measure throughput (samples/second)
+  - Report capacity to coordinator
+  - Update capacity periodically (detect throttling)
+- [ ] Dynamic batch size assignment
+  - Coordinator assigns work proportional to capacity
+  - GPU workers get larger batches
+  - CPU workers get smaller batches
+  - Global batch size = sum of all worker batches
+- [ ] Adaptive aggregation timeout
+  - Parameter servers track gradient arrival times
+  - Compute timeout as 90th percentile of history
+  - Aggregate with available gradients on timeout
+  - Adjust timeout based on cluster dynamics
+- [ ] Proportional data distribution
+  - Dataset sharded based on worker capacity
+  - Fast workers get more data per epoch
+  - All workers complete epoch at similar time
+  - Balanced throughput across heterogeneous hardware
+
+**6. Integration & Testing (Days 17-20)**
+
+- [ ] Replace ring collectives in `trainer.py`
+  - Remove `ring_all_gather_async()` calls
+  - Remove `ring_reduce_scatter_async()` calls
+  - Add `fetch_parameters_async()` implementation
+  - Add `push_gradients_async()` implementation
+  - Add staleness bound checking
+  - Add work stealing logic
+- [ ] End-to-end testing
+  - Test with 2 workers: 1 GPU (fast) + 1 CPU (slow)
+  - Verify GPU worker doesn't idle waiting for CPU
+  - Test worker dropout mid-training (graceful degradation)
+  - Test worker recovery and catch-up
+  - Verify convergence with async updates
+- [ ] Performance benchmarking
+  - Measure GPU utilization (should be >70%)
+  - Compare to ring collectives baseline
+  - Profile communication overhead
+  - Analyze staleness impact on convergence
 
 **Deliverables:**
 
-- `zero/partitioner.py` - Parameter sharding logic
-- `zero/all_gather.py` - ZeRO all-gather
-- `zero/reduce_scatter.py` - ZeRO reduce-scatter
-- `zero/offload.py` - CPU/NVMe offloading
+- `communication/async_collectives.py` - Async parameter fetch/push primitives
+- `communication/parameter_server.py` - Parameter server logic (enhanced grpc_server)
+- `coordinator/version_manager.py` - Version tracking and global version computation
+- `worker/work_stealing.py` - Backup computation for ahead workers
+- `worker/capacity.py` - Worker capacity calibration
+- `worker/async_trainer.py` - Trainer with async communication
+- `tests/integration/test_async_training.py` - Comprehensive async tests
+- Updated `PROJECT.md` with async architecture documentation
 
 **Success Criteria:**
 
-- Train 7B model split across 10 workers
-- Each worker uses <1GB GPU memory
-- Optimizer states successfully offloaded to CPU
-- Training throughput within 2x of single-GPU
+- ✅ GPU workers achieve >70% utilization (vs <2% with ring collectives)
+- ✅ System continues training with 1 worker dropout
+- ✅ Workers catch up after disconnect using gradient replay
+- ✅ Heterogeneous workers (GPU+CPU) contribute proportionally
+- ✅ Training converges with bounded staleness (±5% of synchronous baseline)
+- ✅ Work stealing keeps ahead workers productive
+- ✅ Communication overhead <30% for GPU workers
+
+**Technical Architecture:**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Coordinator                              │
+│  - Version Manager: tracks worker_id → current_step         │
+│  - Work Assignment: assigns backups to ahead workers         │
+│  - Global Version: median(worker_versions)                   │
+└──────────────┬──────────────────────────────────────────────┘
+               │
+    ┌──────────┴──────────┬─────────────┬────────────┐
+    │                     │             │            │
+┌───▼─────┐          ┌───▼──────┐  ┌──▼──────┐  ┌──▼──────┐
+│Worker 0 │          │Worker 1  │  │Worker 2 │  │Worker 3 │
+│ (GPU)   │          │  (GPU)   │  │  (CPU)  │  │  (GPU)  │
+│v=102 ⚡  │          │  v=101   │  │  v=95   │  │  v=100  │
+│         │          │          │  │         │  │         │
+│Fast     │◄────────►│  Fast    │  │  Slow   │  │  Fast   │
+│Helping  │  async   │          │  │ Helped  │  │         │
+└─────────┘  fetch   └──────────┘  └─────────┘  └─────────┘
+     │        push        │             │            │
+     │                    │             │            │
+     └──────────────┬─────┴─────────────┴────────────┘
+                    │
+         Each worker is also a Parameter Server
+         for its owned parameter shards
+```
+
+**Communication Flow:**
+
+```python
+# Fast worker (GPU) training loop
+async def training_step(self):
+    global_version = await coordinator.get_global_version()
+
+    # Check staleness bound
+    if self.current_version > global_version + staleness_bound:
+        # Too far ahead - do work stealing instead of waiting
+        slow_worker = await coordinator.get_slowest_worker()
+        if slow_worker:
+            backup_gradients = await compute_backup_gradients(
+                worker_id=slow_worker.id,
+                version=slow_worker.version
+            )
+            await push_backup_gradients(backup_gradients, slow_worker.version)
+            return  # Skip own training step
+
+    # Normal training step
+    # 1. Fetch parameters asynchronously (parallel, non-blocking)
+    parameters = await fetch_parameters_async(version=global_version)
+
+    # 2. Forward + backward (independent computation)
+    loss = model(batch)
+    loss.backward()
+
+    # 3. Push gradients asynchronously (non-blocking)
+    await push_gradients_async(gradients, version=self.current_version)
+
+    self.current_version += 1
+
+# Parameter server (same worker, different role)
+async def ReceiveGradients(request, context):
+    version = request.version
+    gradients = deserialize_tensor_compressed(request.gradients)
+
+    # Accumulate gradient
+    self.gradient_buffer[version][request.worker_id] = gradients
+
+    # Check if ready to aggregate
+    num_contributions = len(self.gradient_buffer[version])
+    threshold = int(world_size * 0.75)  # 75% of workers
+
+    if num_contributions >= threshold:
+        # Aggregate and apply immediately
+        aggregated = sum(self.gradient_buffer[version].values())
+        self.optimizer.apply_gradients(aggregated)
+        self.parameter_version = version
+```
+
+**Convergence with Bounded Staleness:**
+
+Research shows asynchronous SGD with staleness bound K converges but may need 1.2-1.5x more steps:
+- Staleness introduces gradient noise (gradients computed on stale parameters)
+- Bounded staleness (K=5-10) keeps noise manageable
+- Can compensate with learning rate schedules or staleness-aware updates
+- Net benefit: 6x faster steps × 1.3x more steps needed = **4.6x speedup**
+
+**Papers Supporting This Approach:**
+
+- "More Effective Distributed ML via a Stale Synchronous Parallel Parameter Server" (Ho et al., 2013)
+- "Scaling Distributed Machine Learning with the Parameter Server" (Li et al., 2014)
+- "Asynchronous Parallel Stochastic Gradient for Nonconvex Optimization" (Lian et al., 2015)
 
 ---
 

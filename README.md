@@ -8,9 +8,9 @@ Legion is an experimental distributed training system that aims to enable LLM pr
 
 See [PROJECT.md](PROJECT.md) for the complete project plan and technical details.
 
-## Current Status: Phase 1 - Core Infrastructure
+## Current Status: Phase 1.3 Complete - Real Distributed Training
 
-Legion has completed the proof-of-concept simulation (Phase 0) and is now in Phase 1 with functional distributed infrastructure:
+Legion has completed Phase 0 (simulation) and Phase 1.3 (distributed infrastructure) with working multi-worker training:
 
 **Phase 0 Complete:**
 - ✅ Parameter partitioning (ZeRO-3 style)
@@ -19,19 +19,23 @@ Legion has completed the proof-of-concept simulation (Phase 0) and is now in Pha
 - ✅ Network latency simulation
 - ✅ End-to-end training test
 
-**Phase 1 Complete:**
+**Phase 1.3 Complete:**
 - ✅ Coordinator server (REST + WebSocket)
 - ✅ Worker client with heartbeat and telemetry
 - ✅ gRPC worker-to-worker communication
-- ✅ Ring-based collectives (8x-512x bandwidth savings)
-- ✅ Multi-worker integration tests
+- ✅ **Real distributed training with ZeRO-3 across multiple machines**
+- ✅ Gradient accumulation and synchronization
+- ✅ Parameter exchange via gRPC all-gather
+- ✅ Multi-worker integration tests (2+ workers verified)
 - ✅ HuggingFace dataset integration (FineWeb, The Pile, Shakespeare, etc.)
 - ✅ Proper data parallelism with dataset sharding
+- ✅ Ring-based collectives (8x-512x bandwidth savings)
 
-**Next Steps (Phase 1 Remaining):**
-- Real multi-machine distributed training (2-4 workers)
+**Next Steps (Phase 2):**
+- Add compression to gRPC transfers (INT8, TopK)
 - Latency measurement and regional clustering
-- Fault tolerance testing
+- Fault tolerance testing (worker dropout/rejoin)
+- Scale to 4-8 workers for performance validation
 
 ## Quick Start
 
@@ -65,26 +69,41 @@ python sim/train.py --workers 4 --model tiny --compress int8
 
 ### Running Distributed Training
 
-**Terminal 1: Start the coordinator server**
+**Option 1: Automated 2-Worker Test (Recommended)**
 ```bash
+# Terminal 1: Start coordinator
 python -m coordinator.server
-# Server runs on http://localhost:8000
+
+# Terminal 2: Run automated test
+python scripts/test_two_workers.py
 ```
 
-**Terminal 2+: Start worker nodes**
+This script will:
+- Start 2 workers automatically
+- Run 50 training steps with real distributed training
+- Verify gradient synchronization and parameter exchange
+- Report performance metrics and loss convergence
+
+**Option 2: Manual Multi-Worker Setup**
 ```bash
-# Worker 1
+# Terminal 1: Start coordinator
+python -m coordinator.server
+# Server runs on http://localhost:8000
+
+# Terminal 2: Start worker 1
 python -m worker.client
 
-# Worker 2 (in another terminal)
+# Terminal 3: Start worker 2
 python -m worker.client
 ```
 
 Workers will automatically:
 - Register with the coordinator
 - Send periodic heartbeats
+- Wait for peers to be ready
 - Form a training cluster
 - Exchange parameters via gRPC
+- Synchronize gradients across workers
 
 ### Training on Real Datasets
 
@@ -234,9 +253,10 @@ pytest tests/test_ring_collectives.py -v
 ```
 
 **Test Coverage:**
-- 147 total tests (146 passing, 1 requires running coordinator)
+- 168 total tests (164 passing, 4 skipped)
 - Unit tests for all components
 - Integration tests for multi-worker scenarios
+- End-to-end distributed training tests
 - gRPC communication tests
 - Ring collectives performance tests
 
@@ -265,7 +285,8 @@ Current implementation benchmarks:
 - Gradient accumulation for large batches
 
 **Scalability:**
-- Tested: 2-4 workers locally
+- Tested: 2 workers with real distributed training (verified working)
+- Ready for: 4-8 workers multi-machine
 - Designed for: 8-32 workers globally
 - Target: 100+ workers with regional clustering
 

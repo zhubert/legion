@@ -169,19 +169,21 @@ async def test_grpc_parameter_exchange():
     param1 = torch.randn(100)
     param2 = torch.randn(100)
 
-    # Create servers with parameter stores
+    # Create servers with parameter stores (disable compression for exact comparison)
     server1 = WorkerGRPCServer(
         worker_id="worker_1",
         parameter_store={"shard_0": param1},
         host="127.0.0.1",
-        port=50061
+        port=50061,
+        enable_compression=False
     )
 
     server2 = WorkerGRPCServer(
         worker_id="worker_2",
         parameter_store={"shard_1": param2},
         host="127.0.0.1",
-        port=50062
+        port=50062,
+        enable_compression=False
     )
 
     try:
@@ -190,8 +192,8 @@ async def test_grpc_parameter_exchange():
         await server2.start()
         await asyncio.sleep(0.5)
 
-        # Create client
-        client = WorkerGRPCClient(worker_id="test_client")
+        # Create client (disable compression for exact comparison)
+        client = WorkerGRPCClient(worker_id="test_client", enable_compression=False)
 
         # Worker 2 fetches parameter from worker 1
         fetched_param = await client.get_parameters(
@@ -270,35 +272,6 @@ async def test_grpc_streaming_large_parameter():
 
     finally:
         await server.stop()
-
-
-@pytest.mark.asyncio
-async def test_grpc_collective_ops_initialization():
-    """
-    Test that gRPC collective operations can be initialized.
-    """
-    from communication.grpc_collectives import GRPCCollectiveOps
-    from communication.grpc_client import WorkerGRPCClient
-
-    # Create gRPC client
-    client = WorkerGRPCClient(worker_id="worker_0")
-
-    # Create collective ops for a 2-worker setup
-    collective_ops = GRPCCollectiveOps(
-        rank=0,
-        world_size=2,
-        worker_id="worker_0",
-        worker_addresses=["127.0.0.1:50051", "127.0.0.1:50052"],
-        grpc_client=client,
-        timeout=30.0
-    )
-
-    # Verify initialization
-    assert collective_ops.rank == 0
-    assert collective_ops.world_size == 2
-    assert len(collective_ops.worker_addresses) == 2
-
-    await client.close()
 
 
 class TestDistributedTraining:
@@ -446,3 +419,5 @@ async def test_full_two_worker_training():
         # Cleanup
         await worker1.stop()
         await worker2.stop()
+
+

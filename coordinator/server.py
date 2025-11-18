@@ -22,6 +22,7 @@ import uvicorn
 from coordinator.database import Database
 from coordinator.registry import WorkerRegistry
 from coordinator.clustering import ClusterManager
+from coordinator.version_manager import VersionManager
 
 
 # Configure logging
@@ -77,6 +78,12 @@ class MetricBatchReport(BaseModel):
     """Batch training metric report."""
     worker_id: str = Field(..., description="Worker identifier")
     metrics: List[Dict[str, Any]] = Field(..., description="List of metrics to report")
+
+
+class VersionUpdate(BaseModel):
+    """Worker version update."""
+    worker_id: str = Field(..., description="Worker identifier")
+    version: int = Field(..., description="Current training step version", ge=0)
 
 
 # WebSocket connection manager
@@ -148,13 +155,14 @@ async def heartbeat_monitor():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan (startup/shutdown)."""
-    global db, registry, cluster_manager
+    global db, registry, cluster_manager, version_manager
 
     # Startup
     logger.info("Starting coordinator server...")
     db = Database("coordinator.db")
     registry = WorkerRegistry(db, heartbeat_timeout=90)
     cluster_manager = ClusterManager(latency_threshold_ms=50.0)
+    version_manager = VersionManager(staleness_bound=5)
 
     # Start background tasks
     heartbeat_task = asyncio.create_task(heartbeat_monitor())
@@ -504,22 +512,38 @@ async def training_barrier(worker_id: str, step: str = "training_complete"):
     # Get all online workers
     active_workers = registry.get_online_workers()
     worker_ids = {w.worker_id for w in active_workers}
+    worker_ids_list = sorted(list(worker_ids))  # For consistent ordering
     total_workers = len(worker_ids)
 
-    # Track barrier state in a simple dict (in production, use Redis or DB)
-    if not hasattr(app.state, 'barriers'):
-        app.state.barriers = {}
+    # Use persistent barrier state from database
+    barrier_id = f"{step}_{hash(frozenset(worker_ids_list))}"  # Unique ID per worker set
 
-    barrier_key = step
-    if barrier_key not in app.state.barriers:
-        app.state.barriers[barrier_key] = set()
+    # Get or create barrier
+    barrier = db.get_barrier(barrier_id)
+    if barrier is None:
+        # Create new barrier
+        db.create_or_update_barrier(
+            barrier_id=barrier_id,
+            step=step,
+            worker_ids=worker_ids_list,
+            arrived_workers=[worker_id],
+            status="waiting"
+        )
+        arrived_workers = {worker_id}
+    else:
+        # Update existing barrier
+        arrived_workers = set(barrier['arrived_workers'])
+        arrived_workers.add(worker_id)
+        db.create_or_update_barrier(
+            barrier_id=barrier_id,
+            step=step,
+            worker_ids=worker_ids_list,
+            arrived_workers=sorted(list(arrived_workers)),
+            status="waiting" if len(arrived_workers) < total_workers else "complete"
+        )
 
-    # Add this worker to the barrier
-    app.state.barriers[barrier_key].add(worker_id)
-    reached = len(app.state.barriers[barrier_key])
-
-    # Check if all workers have reached
-    all_ready = app.state.barriers[barrier_key] >= worker_ids
+    reached = len(arrived_workers)
+    all_ready = reached >= total_workers
 
     logger.info(
         f"Barrier '{step}': worker {worker_id} reached "
@@ -529,13 +553,13 @@ async def training_barrier(worker_id: str, step: str = "training_complete"):
     # Cleanup if all workers reached
     if all_ready:
         logger.info(f"Barrier '{step}' complete, all {total_workers} workers ready")
-        del app.state.barriers[barrier_key]
+        db.delete_barrier(barrier_id)
 
     return {
         "reached": reached,
         "total": total_workers,
         "all_ready": all_ready,
-        "waiting_for": list(worker_ids - app.state.barriers[barrier_key]) if not all_ready else []
+        "waiting_for": list(worker_ids - arrived_workers) if not all_ready else []
     }
 
 
@@ -586,6 +610,183 @@ async def check_training_ready(min_workers: int = 2):
         "active_workers": num_active,
         "min_workers": min_workers,
         "workers": worker_info
+    }
+
+
+# Version Management Endpoints (for Async Parameter Server)
+
+@app.post("/training/version/update")
+async def update_worker_version(version_update: VersionUpdate):
+    """
+    Update a worker's current training version.
+
+    Workers should call this endpoint after completing each training step
+    to enable bounded staleness tracking.
+
+    Returns:
+    - global_version: Current global version (median of all workers)
+    - worker_version: This worker's reported version
+    - is_ahead: Whether worker is beyond staleness bound
+    - backup_assignment: Worker ID to help (if ahead), or null
+    """
+    # Update version in version manager
+    worker_info = registry.get_worker(version_update.worker_id)
+    is_healthy = worker_info.status == "online" if worker_info else False
+
+    version_manager.update_worker_version(
+        worker_id=version_update.worker_id,
+        version=version_update.version,
+        is_healthy=is_healthy
+    )
+
+    # Compute global version
+    global_version = version_manager.get_global_version()
+
+    # Check if worker is too far ahead
+    is_ahead = version_manager.is_worker_too_far_ahead(version_update.worker_id)
+
+    # Get backup assignment if ahead
+    backup_assignment = None
+    if is_ahead:
+        backup_assignment = version_manager.get_backup_assignment(version_update.worker_id)
+
+    logger.debug(
+        f"Version update: {version_update.worker_id} → v{version_update.version} "
+        f"(global=v{global_version}, ahead={is_ahead})"
+    )
+
+    return {
+        "global_version": global_version,
+        "worker_version": version_update.version,
+        "is_ahead": is_ahead,
+        "backup_assignment": backup_assignment
+    }
+
+
+@app.get("/training/version/global")
+async def get_global_version():
+    """
+    Get the current global training version.
+
+    Global version is computed as the median of all active workers,
+    preventing one straggler from blocking the entire cluster.
+
+    Returns:
+    - global_version: Median version across active workers
+    - num_workers: Number of workers contributing to global version
+    - staleness_bound: Maximum allowed version gap
+    """
+    global_version = version_manager.get_global_version()
+    num_workers = len([w for w in version_manager.get_all_workers() if w.is_healthy])
+
+    return {
+        "global_version": global_version,
+        "num_workers": num_workers,
+        "staleness_bound": version_manager.staleness_bound
+    }
+
+
+@app.get("/training/version/stats")
+async def get_version_stats():
+    """
+    Get detailed version statistics across the cluster.
+
+    Returns min, max, mean, median versions and staleness metrics.
+    Useful for monitoring training progress and identifying stragglers.
+    """
+    stats = version_manager.get_staleness_stats()
+
+    # Add progress rate
+    stats["progress_rate_versions_per_sec"] = version_manager.get_version_progress_rate()
+
+    return stats
+
+
+@app.get("/training/version/workers")
+async def get_worker_versions():
+    """
+    Get version information for all tracked workers.
+
+    Returns list of workers with their current versions, timestamps,
+    and health status.
+    """
+    workers = version_manager.get_all_workers()
+
+    return {
+        "workers": [
+            {
+                "worker_id": w.worker_id,
+                "version": w.version,
+                "timestamp": w.timestamp,
+                "is_healthy": w.is_healthy
+            }
+            for w in workers
+        ],
+        "count": len(workers)
+    }
+
+
+@app.get("/training/version/slow-workers")
+async def get_slow_workers():
+    """
+    Get list of workers below the global version (stragglers).
+
+    These workers are candidates for receiving backup computation help.
+
+    Returns:
+    - slow_workers: List of worker IDs sorted by version (slowest first)
+    - global_version: Current global version for reference
+    """
+    global_version = version_manager.get_global_version()
+    slow_workers = version_manager.get_slow_workers(global_version)
+
+    return {
+        "slow_workers": slow_workers,
+        "global_version": global_version,
+        "count": len(slow_workers)
+    }
+
+
+@app.get("/training/version/ahead-workers")
+async def get_ahead_workers():
+    """
+    Get list of workers ahead of global version + staleness_bound.
+
+    These workers should perform work stealing instead of progressing.
+
+    Returns:
+    - ahead_workers: List of worker IDs that are too far ahead
+    - global_version: Current global version
+    - staleness_bound: Maximum allowed gap
+    """
+    global_version = version_manager.get_global_version()
+    ahead_workers = version_manager.get_ahead_workers(global_version)
+
+    return {
+        "ahead_workers": ahead_workers,
+        "global_version": global_version,
+        "staleness_bound": version_manager.staleness_bound,
+        "count": len(ahead_workers)
+    }
+
+
+@app.post("/training/version/assign-backups")
+async def assign_backup_work():
+    """
+    Assign ahead workers to help slow workers (work stealing).
+
+    Coordinator matches fastest workers (ahead of staleness bound)
+    with slowest workers for backup gradient computation.
+
+    Returns:
+    - assignments: Dict mapping ahead_worker_id → slow_worker_id
+    - count: Number of assignments made
+    """
+    assignments = version_manager.assign_work_stealing()
+
+    return {
+        "assignments": assignments,
+        "count": len(assignments)
     }
 
 

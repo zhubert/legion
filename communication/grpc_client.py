@@ -16,6 +16,8 @@ from communication.serialization import (
     serialize_tensor,
     deserialize_tensor,
     reassemble_chunks,
+    serialize_tensor_compressed,
+    deserialize_tensor_compressed,
 )
 
 
@@ -27,18 +29,20 @@ class WorkerGRPCClient:
     Client for making gRPC requests to other workers.
     """
 
-    def __init__(self, worker_id: str, timeout: float = 30.0):
+    def __init__(self, worker_id: str, timeout: float = 30.0, enable_compression: bool = True):
         """
         Initialize the gRPC client.
 
         Args:
             worker_id: This worker's unique identifier
             timeout: Default timeout for RPC calls in seconds
+            enable_compression: Whether to enable INT8 compression for transfers
         """
         self.worker_id = worker_id
         self.timeout = timeout
+        self.enable_compression = enable_compression
         self.channels = {}  # Cache of open channels to other workers
-        logger.info(f"Initialized WorkerGRPCClient for worker {worker_id}")
+        logger.info(f"Initialized WorkerGRPCClient for worker {worker_id} (compression={'ON' if enable_compression else 'OFF'})")
 
     def get_channel(self, worker_address: str) -> grpc.aio.Channel:
         """
@@ -97,8 +101,8 @@ class WorkerGRPCClient:
             # Make RPC call
             response = await stub.GetParameters(request, timeout=self.timeout)
 
-            # Deserialize tensor
-            tensor = deserialize_tensor(response.parameters)
+            # Deserialize tensor (handles compression automatically)
+            tensor = deserialize_tensor_compressed(response.parameters)
 
             logger.debug(
                 f"Fetched {parameter_name} from {worker_address}, "
@@ -199,8 +203,8 @@ class WorkerGRPCClient:
             channel = self.get_channel(worker_address)
             stub = worker_pb2_grpc.WorkerServiceStub(channel)
 
-            # Serialize gradients with parameter name
-            grad_proto = serialize_tensor(gradients, name=parameter_name)
+            # Serialize gradients with parameter name (with compression if enabled)
+            grad_proto = serialize_tensor_compressed(gradients, name=parameter_name, compress=self.enable_compression)
 
             # Create request
             request = worker_pb2.GradientUpdate()
@@ -271,6 +275,92 @@ class WorkerGRPCClient:
         except Exception as e:
             logger.error(f"Error pinging {worker_address}: {e}")
             return None
+
+    async def send_ring_chunk(
+        self,
+        worker_address: str,
+        chunk: torch.Tensor,
+        operation_id: str,
+        step: int,
+        rank: int,
+        operation: str = "ALL_GATHER",
+        reduce_op: str = "SUM"
+    ) -> bool:
+        """
+        Send a chunk to a neighbor in a ring collective operation.
+
+        Args:
+            worker_address: Target worker address "host:port"
+            chunk: Tensor chunk to send
+            operation_id: Unique ID for this ring operation
+            step: Current ring step (0 to world_size-1)
+            rank: Sender's rank
+            operation: Ring operation type ("ALL_GATHER", "REDUCE_SCATTER", "ALL_REDUCE")
+            reduce_op: Reduction operation for reduce-scatter ("SUM", "AVG", etc.)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            channel = self.get_channel(worker_address)
+            stub = worker_pb2_grpc.WorkerServiceStub(channel)
+
+            # Serialize chunk (with compression if enabled)
+            chunk_proto = serialize_tensor_compressed(
+                chunk,
+                name=f"{operation_id}_step_{step}",
+                compress=self.enable_compression
+            )
+
+            # Create request
+            request = worker_pb2.RingChunkRequest()
+            request.sender_id = self.worker_id
+            request.chunk.CopyFrom(chunk_proto)
+            request.operation_id = operation_id
+            request.step = step
+            request.rank = rank
+
+            # Set operation type
+            op_map = {
+                "ALL_GATHER": worker_pb2.RingChunkRequest.ALL_GATHER,
+                "REDUCE_SCATTER": worker_pb2.RingChunkRequest.REDUCE_SCATTER,
+                "ALL_REDUCE": worker_pb2.RingChunkRequest.ALL_REDUCE,
+            }
+            request.operation = op_map.get(operation, worker_pb2.RingChunkRequest.ALL_GATHER)
+
+            # Set reduce operation
+            reduce_map = {
+                "SUM": worker_pb2.RingChunkRequest.SUM,
+                "AVG": worker_pb2.RingChunkRequest.AVG,
+                "MAX": worker_pb2.RingChunkRequest.MAX,
+                "MIN": worker_pb2.RingChunkRequest.MIN,
+            }
+            request.reduce_op = reduce_map.get(reduce_op, worker_pb2.RingChunkRequest.SUM)
+
+            # Send chunk
+            response = await stub.SendRingChunk(request, timeout=self.timeout)
+
+            if not response.success:
+                logger.warning(
+                    f"Ring chunk send failed: {response.message}"
+                )
+                return False
+
+            logger.debug(
+                f"Sent ring chunk to {worker_address} "
+                f"(op={operation_id}, step={step}, size={chunk.numel()})"
+            )
+            return True
+
+        except grpc.RpcError as e:
+            logger.error(
+                f"RPC error sending ring chunk to {worker_address}: "
+                f"{e.code()} - {e.details()}"
+            )
+            return False
+        except Exception as e:
+            logger.error(f"Error sending ring chunk to {worker_address}: {e}")
+            return False
 
     async def close(self):
         """Close all open channels."""

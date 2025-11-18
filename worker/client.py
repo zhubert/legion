@@ -136,7 +136,8 @@ class WorkerClient:
         logger.info("Initializing gRPC client...")
         self.grpc_client = WorkerGRPCClient(
             worker_id=self.config.worker_id,
-            timeout=30.0
+            timeout=30.0,
+            enable_compression=True  # Enable INT8 compression (4x bandwidth reduction)
         )
         logger.info("✓ gRPC client initialized")
 
@@ -148,7 +149,8 @@ class WorkerClient:
             worker_id=self.config.worker_id,
             parameter_store={},  # Empty initially, populated during training setup
             host="0.0.0.0",
-            port=self.config.port
+            port=self.config.port,
+            enable_compression=True  # Enable INT8 compression (4x bandwidth reduction)
         )
         await self.grpc_server.start()
         logger.info(f"✓ gRPC server started on {self.config.ip_address}:{self.config.port}")

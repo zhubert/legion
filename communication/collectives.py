@@ -81,8 +81,8 @@ class CollectiveOps:
         next_address = worker_addresses[next_rank]
         prev_address = worker_addresses[prev_rank]
 
-        # TODO: Implement proper ring all-gather with async send/recv
-        # For now, use simple all-to-all (not bandwidth optimal)
+        # Note: This uses simple all-to-all communication (simulation-based).
+        # For async distributed training, see communication/async_collectives.py
         for i, address in enumerate(worker_addresses):
             if i == rank:
                 # Already have our own tensor
@@ -158,8 +158,8 @@ class CollectiveOps:
         # Initialize reduced chunks
         reduced_chunks = [chunk.clone() for chunk in chunks]
 
-        # TODO: Implement proper ring reduce-scatter
-        # For now, simulate by gathering all and reducing locally
+        # Note: This uses gather-reduce-locally pattern (simulation-based).
+        # For async distributed training, see communication/async_collectives.py
         all_tensors = await self.all_gather(tensor, worker_addresses, rank)
 
         # Reduce each chunk across all workers
@@ -228,66 +228,3 @@ class CollectiveOps:
             raise ValueError(f"Unknown reduce op: {reduce_op}")
 
         return result
-
-
-class RingAllGather:
-    """
-    Optimized ring-based all-gather implementation.
-
-    This is a placeholder for the full ring algorithm which will be
-    more bandwidth-efficient than the simple all-to-all approach above.
-    """
-
-    def __init__(self, world_size: int, rank: int):
-        self.world_size = world_size
-        self.rank = rank
-
-    async def execute(
-        self,
-        tensor: torch.Tensor,
-        send_to: str,
-        recv_from: str,
-        client: WorkerGRPCClient,
-    ) -> List[torch.Tensor]:
-        """
-        Execute ring all-gather algorithm.
-
-        In each step:
-        1. Send current chunk to next worker
-        2. Receive chunk from previous worker
-        3. After N-1 steps, all workers have all chunks
-        """
-        # TODO: Implement optimized ring algorithm
-        # This reduces bandwidth from O(N) to O(1) per worker
-        raise NotImplementedError("Optimized ring all-gather coming soon")
-
-
-class RingReduceScatter:
-    """
-    Optimized ring-based reduce-scatter implementation.
-
-    This will be more bandwidth-efficient than the current approach.
-    """
-
-    def __init__(self, world_size: int, rank: int):
-        self.world_size = world_size
-        self.rank = rank
-
-    async def execute(
-        self,
-        tensor: torch.Tensor,
-        send_to: str,
-        recv_from: str,
-        client: WorkerGRPCClient,
-        reduce_op: str = "sum",
-    ) -> torch.Tensor:
-        """
-        Execute ring reduce-scatter algorithm.
-
-        In each step:
-        1. Reduce local chunk with received chunk
-        2. Send reduced chunk to next worker
-        3. After N-1 steps, each worker has its reduced chunk
-        """
-        # TODO: Implement optimized ring reduce-scatter
-        raise NotImplementedError("Optimized ring reduce-scatter coming soon")

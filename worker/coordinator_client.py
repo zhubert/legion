@@ -80,7 +80,7 @@ class CoordinatorClient:
     async def wait_at_barrier(
         self,
         step: str = "training_complete",
-        poll_interval: float = 1.0,
+        poll_interval: float = 5.0,
         timeout: float = 300.0
     ) -> bool:
         """
@@ -88,8 +88,8 @@ class CoordinatorClient:
 
         Args:
             step: Barrier step name
-            poll_interval: How often to poll in seconds
-            timeout: Maximum time to wait in seconds
+            poll_interval: How often to poll in seconds (default: 5.0)
+            timeout: Maximum time to wait in seconds (default: 300.0)
 
         Returns:
             True if barrier completed, False if timeout
