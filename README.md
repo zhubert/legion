@@ -25,16 +25,19 @@ Legion has completed Phase 0 (simulation) and Phase 1.3 (distributed infrastruct
 - ✅ gRPC worker-to-worker communication
 - ✅ **Real distributed training with ZeRO-3 across multiple machines**
 - ✅ Gradient accumulation and synchronization
-- ✅ Parameter exchange via gRPC all-gather
+- ✅ Parameter exchange via gRPC all-gather and reduce-scatter
 - ✅ Multi-worker integration tests (2+ workers verified)
 - ✅ HuggingFace dataset integration (FineWeb, The Pile, Shakespeare, etc.)
 - ✅ Proper data parallelism with dataset sharding
-- ✅ Ring-based collectives (8x-512x bandwidth savings)
+- ✅ Async collective operations for improved overlap
+- ✅ Version manager for model checkpoint coordination
+- ✅ Work stealing infrastructure for fault tolerance
 
 **Next Steps (Phase 2):**
 - Add compression to gRPC transfers (INT8, TopK)
+- Implement ring-based collectives for bandwidth efficiency
 - Latency measurement and regional clustering
-- Fault tolerance testing (worker dropout/rejoin)
+- Enhanced fault tolerance testing (worker dropout/rejoin)
 - Scale to 4-8 workers for performance validation
 
 ## Quick Start
@@ -135,15 +138,12 @@ python -m worker.client \
 - `tiny_shakespeare` - 1MB for testing
 - `shakespeare` - Complete works of Shakespeare
 
-See [DATASETS.md](DATASETS.md) for detailed dataset documentation.
-
 ## Project Structure
 
 ```
 legion/
 ├── PROJECT.md              # Detailed project plan
 ├── README.md               # This file
-├── DATASETS.md             # Dataset usage guide
 ├── CLAUDE.md               # Development guide
 ├── requirements.txt        # Python dependencies
 ├── core/                   # Shared core functionality
@@ -159,7 +159,8 @@ legion/
 │   ├── server.py           # FastAPI REST + WebSocket server
 │   ├── registry.py         # Worker registration and health
 │   ├── clustering.py       # Latency-based regional clustering
-│   └── database.py         # SQLite persistence
+│   ├── database.py         # SQLite persistence
+│   └── version_manager.py  # Model checkpoint version tracking
 ├── worker/                 # Phase 1: Distributed worker nodes
 │   ├── client.py           # Main worker orchestration
 │   ├── coordinator_client.py  # HTTP client for coordinator
@@ -168,16 +169,16 @@ legion/
 │   ├── shard_manager.py    # Parameter shard management
 │   └── telemetry.py        # Metrics reporting
 ├── communication/          # Phase 1: Worker-to-worker gRPC
-│   ├── grpc_server.py      # gRPC server for parameters
-│   ├── grpc_client.py      # gRPC client for requests
-│   ├── grpc_collectives.py # gRPC-based all-gather/reduce-scatter
-│   ├── ring_collectives.py # Ring-based bandwidth optimization
+│   ├── grpc_server.py      # gRPC server for parameters and gradients
+│   ├── grpc_client.py      # gRPC client for parameter exchange
+│   ├── collectives.py      # Shared-memory collective operations
+│   ├── async_collectives.py # Async all-gather/reduce-scatter
 │   ├── serialization.py    # Tensor serialization/chunking
 │   └── proto/              # Protocol buffer definitions
 └── tests/                  # Comprehensive test suite
     ├── integration/        # Multi-worker integration tests
     ├── test_*.py           # Unit tests
-    └── ...                 # 147 tests total
+    └── ...                 # 168 tests total
 ```
 
 ## Key Concepts
@@ -201,31 +202,24 @@ Gradients are compressed before transmission:
 - **1-bit Adam** (planned): 32x compression after warmup
 - **Target**: 64-100x total compression
 
-### Ring-Based Collectives
+### Async Collective Operations
 
-Bandwidth-efficient communication pattern where each worker only talks to 2 neighbors:
+Legion uses asynchronous collective operations for improved overlap and efficiency:
 
-```
-Worker topology: 0 <-> 1 <-> 2 <-> 3 <-> 0
-```
+- **Async all-gather**: Non-blocking parameter collection from peers
+- **Async reduce-scatter**: Overlapped gradient aggregation and distribution
+- **Background I/O**: Communication overlaps with computation
+- **Future-based API**: Enables pipeline parallelism across training steps
 
-**Bandwidth savings vs naive all-to-all:**
-- 4 workers: 8x reduction
-- 8 workers: 32x reduction
-- 16 workers: 128x reduction
-- 32 workers: 512x reduction
-
-Example: For a 1B parameter model (4GB) on 16 workers:
-- Ring all-reduce: ~7.75 GB total communication
-- Naive all-reduce: ~960 GB total communication
-- **128x improvement!**
+This design allows workers to hide communication latency behind computation.
 
 ### Network Architecture
 
 **Coordinator** (FastAPI server):
 - Worker registration and health monitoring
 - Regional clustering based on latency
-- Metrics aggregation
+- Metrics aggregation and version tracking
+- Model checkpoint coordination
 - NOT in the training loop (peer-to-peer communication)
 
 **Workers** (async Python clients):
@@ -233,6 +227,7 @@ Example: For a 1B parameter model (4GB) on 16 workers:
 - gRPC client for fetching from peers
 - Training loop with ZeRO-3 partitioning
 - Automatic fault detection and recovery
+- Work stealing for load balancing
 
 ## Testing
 
@@ -249,7 +244,7 @@ pytest --cov=sim --cov=coordinator --cov=worker --cov=communication
 pytest tests/integration/
 
 # Specific test file
-pytest tests/test_ring_collectives.py -v
+pytest tests/test_async_collectives.py -v
 ```
 
 **Test Coverage:**
@@ -258,7 +253,8 @@ pytest tests/test_ring_collectives.py -v
 - Integration tests for multi-worker scenarios
 - End-to-end distributed training tests
 - gRPC communication tests
-- Ring collectives performance tests
+- Async collectives tests
+- Version manager and work stealing tests
 
 ## Contributing
 
@@ -277,7 +273,7 @@ Current implementation benchmarks:
 **Communication:**
 - gRPC parameter transfer: Supports 100MB+ messages
 - Tensor serialization: NumPy-based with chunking
-- Ring all-reduce: O(N) steps, O(1) bandwidth per worker
+- Async collectives: Non-blocking all-gather and reduce-scatter
 
 **Memory:**
 - ZeRO-3 partitioning: `O(model_size / num_workers)` per worker
@@ -295,7 +291,7 @@ Current implementation benchmarks:
 **Papers:**
 - [DeepSpeed ZeRO](https://arxiv.org/abs/1910.02054) - Parameter partitioning
 - [1-bit Adam](https://arxiv.org/abs/2102.02888) - Gradient compression
-- [Ring All-Reduce](https://andrew.gibiansky.com/blog/machine-learning/baidu-allreduce/) - Bandwidth optimization
+- [PyTorch FSDP](https://arxiv.org/abs/2304.11277) - Async collective operations
 
 **Documentation:**
 - [DeepSpeed](https://www.deepspeed.ai/)
