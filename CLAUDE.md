@@ -223,9 +223,9 @@ Following the author's style guide (STYLEGUIDE.md):
 
 **Next Steps (Phase 2)**:
 1. Add gradient compression to gRPC transfers (INT8)
-2. Implement ring-based collectives for bandwidth efficiency
-3. Latency measurement and regional clustering
-4. Fault tolerance testing (worker dropout/rejoin)
+2. Latency measurement and regional clustering
+3. Fault tolerance testing (worker dropout/rejoin)
+4. Async gradient accumulation with variable worker participation
 5. Scale to 4-8 workers for production testing
 
 ## Common Pitfalls
@@ -239,6 +239,8 @@ Following the author's style guide (STYLEGUIDE.md):
 4. **Async/await**: Worker client uses asyncio extensively. Remember to await async functions and use `asyncio.run()` for entry points.
 
 5. **Device management**: The simulation defaults to CPU. Real workers should detect GPU availability via `torch.cuda.is_available()`.
+
+6. **NO RING TOPOLOGIES**: Legion explicitly does NOT use ring-based collectives (ring allreduce, etc.). Ring topologies assume stable, synchronous workers completing at the same time - the exact opposite of Legion's design. Legion has hundreds of heterogeneous consumer machines (CPU/GPU mix) joining/leaving dynamically and finishing training units at vastly different times. The peer-to-peer async all-gather/reduce-scatter architecture is the correct approach for this use case.
 
 ## Dependencies
 

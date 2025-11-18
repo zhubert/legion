@@ -35,9 +35,9 @@ Legion has completed Phase 0 (simulation) and Phase 1.3 (distributed infrastruct
 
 **Next Steps (Phase 2):**
 - Add compression to gRPC transfers (INT8, TopK)
-- Implement ring-based collectives for bandwidth efficiency
 - Latency measurement and regional clustering
 - Enhanced fault tolerance testing (worker dropout/rejoin)
+- Async gradient accumulation with variable worker participation
 - Scale to 4-8 workers for performance validation
 
 ## Quick Start
