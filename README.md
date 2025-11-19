@@ -12,42 +12,37 @@ Legion is a research prototype exploring whether modern distributed training tec
 
 See [PROJECT.md](PROJECT.md) for the complete project plan and technical details.
 
-## Current Status: Phase 0/1 - Basic Infrastructure Only
+## What's Built vs What's Not
 
-Legion has basic simulation and minimal distributed infrastructure. Real distributed training across the internet remains theoretical:
-
-**Phase 0 (Simulation) - Partially Working:**
+**Works (Single Machine Only):**
 - ✅ Single-machine simulation with fake "workers" (threads/processes)
-- ✅ Parameter partitioning (ZeRO-3 style) - simulated only
+- ✅ Parameter partitioning (ZeRO-3 style) - simulated in-memory only
 - ✅ Collective communication (all-gather, reduce-scatter) - in-memory only
-- ⚠️ Gradient compression (INT8 quantization) - implemented but not integrated
-- ⚠️ Network latency simulation - artificial delays, not real networks
-- ⚠️ End-to-end training test - toy model only, single machine
+- ✅ Tiny transformer model for testing
 
-**Phase 1 (Distributed Infrastructure) - Mostly Incomplete:**
+**Partially Exists (Untested/Incomplete):**
 - ⚠️ Coordinator server (REST + WebSocket) - basic skeleton, minimal testing
 - ⚠️ Worker client with heartbeat - exists but brittle
 - ⚠️ gRPC worker-to-worker communication - prototype only, not production-ready
+- ⚠️ Gradient compression (INT8 quantization) - implemented but not integrated
+- ⚠️ HuggingFace dataset integration - basic loader exists, sharding untested
+- ⚠️ Network latency simulation - artificial delays only, not real networks
+
+**Doesn't Work / Not Built:**
 - ❌ Real distributed training across machines - **NOT TESTED AT SCALE**
 - ❌ Gradient synchronization across internet - **THEORETICAL ONLY**
 - ❌ Parameter exchange over real networks - **UNTESTED WITH REAL LATENCY**
 - ❌ Multi-worker training on separate machines - **MAY NOT WORK**
-- ⚠️ HuggingFace dataset integration - basic loader exists, sharding untested
 - ❌ Proper data parallelism - **NOT VALIDATED**
 - ❌ Async collective operations - **EXPERIMENTAL, LIKELY BROKEN**
-- ❌ Fault tolerance - **NOT IMPLEMENTED**
+- ❌ Fault tolerance (worker dropout/rejoin) - **NOT IMPLEMENTED**
 - ❌ Work stealing - **SKELETON CODE ONLY**
+- ❌ Regional clustering based on latency - **NOT IMPLEMENTED**
+- ❌ Security (authentication, encryption) - **NOT IMPLEMENTED**
+- ❌ Performance optimization for internet - **NOT IMPLEMENTED**
 
-**What Actually Needs to Happen (Phase 2+):**
-- Actually test 2+ workers on separate machines over real networks
-- Implement and verify gradient compression in gRPC
-- Build real fault tolerance (workers dropping/rejoining)
-- Measure actual latency and implement clustering
-- Handle asynchronous workers with variable speeds
-- Security (authentication, encryption)
-- Scale beyond 2-4 workers
-- Performance optimization for real internet conditions
-- **Everything else on the roadmap**
+**Bottom Line:**
+The simulation works on a single machine. Everything else is incomplete, untested, or purely theoretical. Distributed training across the internet has not been validated.
 
 ## Quick Start (Local Experimentation Only)
 
