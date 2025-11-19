@@ -2,45 +2,51 @@
 
 > _A SETI@home for training language models - distributed pre-training across the internet_
 
-## Overview
+## ⚠️ PROJECT STATUS: EARLY EXPERIMENTAL RESEARCH - NOT READY FOR USE
 
-Legion is an experimental distributed training system that aims to enable LLM pre-training across consumer-grade machines. Inspired by SETI@home, it explores whether modern distributed training techniques (ZeRO, gradient compression, fault tolerance) can work over high-latency, low-bandwidth consumer networks.
+**This project is in active early-stage development and is NOT functional for real-world use.**
+
+Legion is a research prototype exploring whether modern distributed training techniques (ZeRO, gradient compression) can work over high-latency consumer internet connections. Most components are incomplete, untested at scale, or purely theoretical.
+
+**Do not attempt to use this for actual model training.** This is research code to validate concepts, not production software.
 
 See [PROJECT.md](PROJECT.md) for the complete project plan and technical details.
 
-## Current Status: Phase 1.3 Complete - Real Distributed Training
+## What's Built vs What's Not
 
-Legion has completed Phase 0 (simulation) and Phase 1.3 (distributed infrastructure) with working multi-worker training:
+**Works (Single Machine Only):**
+- ✅ Single-machine simulation with fake "workers" (threads/processes)
+- ✅ Parameter partitioning (ZeRO-3 style) - simulated in-memory only
+- ✅ Collective communication (all-gather, reduce-scatter) - in-memory only
+- ✅ Tiny transformer model for testing
 
-**Phase 0 Complete:**
-- ✅ Parameter partitioning (ZeRO-3 style)
-- ✅ Collective communication (all-gather, reduce-scatter)
-- ✅ Gradient compression (INT8 quantization)
-- ✅ Network latency simulation
-- ✅ End-to-end training test
+**Partially Exists (Untested/Incomplete):**
+- ⚠️ Coordinator server (REST + WebSocket) - basic skeleton, minimal testing
+- ⚠️ Worker client with heartbeat - exists but brittle
+- ⚠️ gRPC worker-to-worker communication - prototype only, not production-ready
+- ⚠️ Gradient compression (INT8 quantization) - implemented but not integrated
+- ⚠️ HuggingFace dataset integration - basic loader exists, sharding untested
+- ⚠️ Network latency simulation - artificial delays only, not real networks
 
-**Phase 1.3 Complete:**
-- ✅ Coordinator server (REST + WebSocket)
-- ✅ Worker client with heartbeat and telemetry
-- ✅ gRPC worker-to-worker communication
-- ✅ **Real distributed training with ZeRO-3 across multiple machines**
-- ✅ Gradient accumulation and synchronization
-- ✅ Parameter exchange via gRPC all-gather and reduce-scatter
-- ✅ Multi-worker integration tests (2+ workers verified)
-- ✅ HuggingFace dataset integration (FineWeb, The Pile, Shakespeare, etc.)
-- ✅ Proper data parallelism with dataset sharding
-- ✅ Async collective operations for improved overlap
-- ✅ Version manager for model checkpoint coordination
-- ✅ Work stealing infrastructure for fault tolerance
+**Doesn't Work / Not Built:**
+- ❌ Real distributed training across machines - **NOT TESTED AT SCALE**
+- ❌ Gradient synchronization across internet - **THEORETICAL ONLY**
+- ❌ Parameter exchange over real networks - **UNTESTED WITH REAL LATENCY**
+- ❌ Multi-worker training on separate machines - **MAY NOT WORK**
+- ❌ Proper data parallelism - **NOT VALIDATED**
+- ❌ Async collective operations - **EXPERIMENTAL, LIKELY BROKEN**
+- ❌ Fault tolerance (worker dropout/rejoin) - **NOT IMPLEMENTED**
+- ❌ Work stealing - **SKELETON CODE ONLY**
+- ❌ Regional clustering based on latency - **NOT IMPLEMENTED**
+- ❌ Security (authentication, encryption) - **NOT IMPLEMENTED**
+- ❌ Performance optimization for internet - **NOT IMPLEMENTED**
 
-**Next Steps (Phase 2):**
-- Add compression to gRPC transfers (INT8, TopK)
-- Latency measurement and regional clustering
-- Enhanced fault tolerance testing (worker dropout/rejoin)
-- Async gradient accumulation with variable worker participation
-- Scale to 4-8 workers for performance validation
+**Bottom Line:**
+The simulation works on a single machine. Everything else is incomplete, untested, or purely theoretical. Distributed training across the internet has not been validated.
 
-## Quick Start
+## Quick Start (Local Experimentation Only)
+
+**Warning:** These instructions are for local development and testing only. Do not expect production-quality distributed training.
 
 ### Installation
 
@@ -70,7 +76,9 @@ python sim/train.py --workers 4 --model tiny --latency 50
 python sim/train.py --workers 4 --model tiny --compress int8
 ```
 
-### Running Distributed Training
+### Running Distributed Training (Experimental - Likely Broken)
+
+**CRITICAL WARNING:** Distributed training is experimental prototype code. It may work on localhost but has NOT been validated on real distributed networks. Expect bugs, crashes, and data loss.
 
 **Important:** The coordinator controls all training configuration (dataset, model, hyperparameters). Workers automatically fetch and execute the coordinator's decisions.
 
@@ -309,22 +317,28 @@ pytest tests/test_async_collectives.py -v
 
 ## Contributing
 
-This is an early-stage research project. Contributions are welcome!
+This is an **extremely early-stage research prototype**. The codebase is unstable, incomplete, and poorly tested.
 
-See [CLAUDE.md](CLAUDE.md) for development guidance.
+If you're interested in contributing:
+1. Understand this is experimental research code, not production software
+2. Most features are incomplete or broken
+3. Breaking changes happen frequently
+4. Documentation may be outdated or aspirational
+
+See [CLAUDE.md](CLAUDE.md) for development guidance and [PROJECT.md](PROJECT.md) for the (ambitious) roadmap.
 
 ## License
 
 MIT License - See [LICENSE](LICENSE)
 
-## Performance Characteristics
+## Performance Characteristics (Theoretical/Untested)
 
-Current implementation benchmarks:
+**Warning:** These are design goals and minimal local testing, NOT production benchmarks.
 
 **Communication:**
-- gRPC parameter transfer: Supports 100MB+ messages
-- Tensor serialization: NumPy-based with chunking
-- Async collectives: Non-blocking all-gather and reduce-scatter
+- gRPC parameter transfer: Theoretically supports 100MB+ messages (untested at scale)
+- Tensor serialization: Basic NumPy-based with chunking (not optimized)
+- Async collectives: Experimental non-blocking all-gather and reduce-scatter (likely broken)
 
 **Memory:**
 - ZeRO-3 partitioning: `O(model_size / num_workers)` per worker
@@ -332,10 +346,11 @@ Current implementation benchmarks:
 - Gradient accumulation for large batches
 
 **Scalability:**
-- Tested: 2 workers with real distributed training (verified working)
-- Ready for: 4-8 workers multi-machine
-- Designed for: 8-32 workers globally
-- Target: 100+ workers with regional clustering
+- Actually Tested: Single machine simulation only
+- Maybe Works: 2 workers on localhost (not verified on separate machines)
+- Aspirational Goal: 4-8 workers multi-machine (completely untested)
+- Theoretical Design: 8-32 workers globally (no validation)
+- Pie-in-the-Sky Target: 100+ workers with regional clustering (very far away)
 
 ## Resources
 
@@ -351,4 +366,6 @@ Current implementation benchmarks:
 
 ---
 
-_Let's democratize AI training, one GPU at a time._ 🚀
+_Attempting to democratize AI training, one broken prototype at a time._ 🧪
+
+**Remember: This is research code. It probably doesn't work. Use at your own risk.**
