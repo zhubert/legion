@@ -4,11 +4,15 @@ Main worker client for Legion distributed training.
 Orchestrates all worker components and manages the complete worker lifecycle.
 """
 
+import os
 import asyncio
 import signal
 import logging
 from typing import Optional, List, Tuple
 import torch
+
+# Enable gRPC fork support to avoid warnings when datasets use multiprocessing
+os.environ.setdefault('GRPC_ENABLE_FORK_SUPPORT', '1')
 
 from worker.config import WorkerConfig
 from worker.coordinator_client import CoordinatorClient
@@ -65,6 +69,7 @@ class WorkerClient:
         # State
         self._running = False
         self._shutdown_event = asyncio.Event()
+        self._agreed_global_step: Optional[int] = None  # For checkpoint saving
 
         logger.info(f"Worker client initialized: {config.worker_id}")
 
@@ -187,17 +192,8 @@ class WorkerClient:
             await self.telemetry_reporter.report(force=True)
             logger.info("✓ Final metrics reported")
 
-        # Save final checkpoint
-        if self.shard_manager and self.shard_manager.is_loaded():
-            logger.info("Saving final checkpoint...")
-            try:
-                step = self.trainer.get_current_step() if self.trainer else 0
-                checkpoint_path = self.shard_manager.save_checkpoint(
-                    global_step=step
-                )
-                logger.info(f"✓ Checkpoint saved: {checkpoint_path}")
-            except Exception as e:
-                logger.error(f"Failed to save checkpoint: {e}")
+        # Checkpoint already saved by trainer before barrier
+        # No need to save again here
 
         # Stop gRPC server and client
         if self.grpc_server:
@@ -235,15 +231,59 @@ class WorkerClient:
 
         Args:
             dataset: Training dataset (optional, will be created if not provided)
-            num_steps: Number of training steps
+            num_steps: Number of training steps (optional, uses coordinator config if not provided)
             use_distributed: Whether to use distributed multi-worker training
         """
         if not self._running:
             raise RuntimeError("Worker not started. Call start() first.")
 
-        # Get cluster information from coordinator
-        rank = 0
-        world_size = 1
+        # Fetch training configuration from coordinator
+        logger.info("Fetching training configuration from coordinator...")
+        training_config_response = await self.coordinator_client.get_training_config()
+
+        if not training_config_response:
+            logger.error("Failed to fetch training config from coordinator")
+            raise RuntimeError(
+                "Cannot start training without configuration from coordinator. "
+                "Make sure the coordinator is running and accessible."
+            )
+
+        # Extract configuration
+        rank = training_config_response.get('rank', 0)
+        world_size = training_config_response.get('world_size', 1)
+        training_config = training_config_response.get('config', {})
+
+        logger.info(
+            f"Training config received from coordinator:\n"
+            f"  Rank: {rank}/{world_size}\n"
+            f"  Model: {training_config.get('model_size')}\n"
+            f"  Dataset: {training_config.get('dataset_type')} "
+            f"({training_config.get('dataset_name', 'N/A')})\n"
+            f"  Batch size: {training_config.get('batch_size')}\n"
+            f"  Sequence length: {training_config.get('seq_len')}\n"
+            f"  Steps: {training_config.get('num_steps')}"
+        )
+
+        # Override local config with coordinator's decisions
+        # (This ensures coordinator has full control)
+        model_size = training_config.get('model_size', self.config.model_size)
+        batch_size = training_config.get('batch_size', self.config.batch_size)
+        seq_len = training_config.get('seq_len', self.config.seq_len)
+        learning_rate = training_config.get('learning_rate', self.config.learning_rate)
+        compression = training_config.get('compression', self.config.compression)
+        dataset_type = training_config.get('dataset_type', self.config.dataset_type)
+        dataset_name = training_config.get('dataset_name', self.config.dataset_name)
+        tokenizer_name = training_config.get('tokenizer_name', self.config.tokenizer_name)
+
+        # num_steps: Use parameter > coordinator config > worker config
+        if num_steps is None:
+            num_steps = training_config.get('num_steps', self.config.num_steps)
+
+        # Determine if distributed based on world_size
+        if world_size > 1:
+            use_distributed = True
+
+        # Get cluster information from coordinator if distributed
         worker_addresses = []
 
         if use_distributed:
@@ -253,16 +293,12 @@ class WorkerClient:
                 workers_response = await self.coordinator_client.get_workers(status="online")
                 if workers_response and 'workers' in workers_response:
                     workers = workers_response['workers']
-                    world_size = len(workers)
 
                     # Sort workers by worker_id to ensure consistent rank assignment
                     workers = sorted(workers, key=lambda w: w.get('worker_id', ''))
 
-                    # Find our rank
-                    for i, worker in enumerate(workers):
-                        if worker.get('worker_id') == self.config.worker_id:
-                            rank = i
-                        # Build worker addresses list
+                    # Build worker addresses list
+                    for worker in workers:
                         ip = worker.get('ip_address', 'localhost')
                         port = worker.get('port', 50051)
                         worker_addresses.append(f"{ip}:{port}")
@@ -297,59 +333,59 @@ class WorkerClient:
                 except Exception as e:
                     logger.warning(f"✗ Cannot reach worker at {addr}: {e}")
 
-        # Create dataset if not provided
+        # Create dataset if not provided (using coordinator's configuration)
+        # Also track vocab_size from dataset for model creation
+        vocab_size_override = None
         if dataset is None:
-            dataset_type = self.config.dataset_type
-            dataset_name = self.config.dataset_name
-
-            # Determine dataset type from config
+            # Determine dataset type from coordinator config
             if dataset_type == "huggingface" and dataset_name:
                 # HuggingFace dataset (fineweb, pile, shakespeare, etc.)
                 logger.info(f"Loading HuggingFace dataset: {dataset_name}")
                 from core.dataset import create_huggingface_dataset
-                dataset = create_huggingface_dataset(
+                dataset, vocab_size_override = create_huggingface_dataset(
                     dataset_name=dataset_name,
                     rank=rank,
                     world_size=world_size,
-                    num_batches=num_steps or self.config.num_steps,
-                    batch_size=self.config.batch_size,
-                    tokenizer_name=self.config.tokenizer_name,
-                    seq_len=self.config.seq_len,
+                    num_batches=num_steps,
+                    batch_size=batch_size,
+                    tokenizer_name=tokenizer_name,
+                    seq_len=seq_len,
                     seed=42
                 )
                 logger.info(
                     f"Loaded HuggingFace dataset '{dataset_name}' for rank {rank}/{world_size} "
-                    f"(effective global batch size: {self.config.batch_size * world_size})"
+                    f"(vocab_size={vocab_size_override}, effective global batch size: {batch_size * world_size})"
                 )
             elif dataset_type == "distributed_dummy" or (use_distributed and world_size > 1):
                 # Distributed dummy dataset (for testing multi-worker)
                 from core.dataset import create_distributed_dataset
                 dataset = create_distributed_dataset(
                     vocab_size=1000,
-                    seq_len=self.config.seq_len,
-                    num_batches=num_steps or self.config.num_steps,
-                    batch_size=self.config.batch_size,
+                    seq_len=seq_len,
+                    num_batches=num_steps,
+                    batch_size=batch_size,
                     rank=rank,
                     world_size=world_size,
                     seed=42
                 )
                 logger.info(
                     f"Created distributed dummy dataset shard for rank {rank}/{world_size} "
-                    f"(effective global batch size: {self.config.batch_size * world_size})"
+                    f"(effective global batch size: {batch_size * world_size})"
                 )
             else:
                 # Single-worker dummy dataset (default)
                 from core.dataset import create_dummy_dataset
                 dataset = create_dummy_dataset(
                     vocab_size=1000,
-                    seq_len=self.config.seq_len,
-                    num_batches=num_steps or self.config.num_steps,
-                    batch_size=self.config.batch_size
+                    seq_len=seq_len,
+                    num_batches=num_steps,
+                    batch_size=batch_size
                 )
-                logger.info(f"Created single-worker dummy dataset (batch size: {self.config.batch_size})")
+                logger.info(f"Created single-worker dummy dataset (batch size: {batch_size})")
 
-        # Create model for shard manager
-        model = create_model(self.config.model_size)
+        # Create model for shard manager (using coordinator's model_size)
+        # Pass vocab_size from HuggingFace tokenizer if available
+        model = create_model(model_size, vocab_size=vocab_size_override)
         total_params = model.count_parameters()
 
         # Initialize shard manager (we own all parameters for now)
@@ -359,20 +395,23 @@ class WorkerClient:
             shard_start=0,
             shard_end=total_params,
             device=self.config.device,
-            checkpoint_dir=self.config.checkpoint_dir
+            checkpoint_dir=self.config.checkpoint_dir,
+            rank=rank,
+            world_size=world_size
         )
         self.shard_manager.load_shard()
         logger.info("✓ Shard manager initialized")
 
-        # Initialize trainer
+        # Initialize trainer (using coordinator's hyperparameters)
         self.trainer = DistributedTrainer(
             worker_id=self.config.worker_id,
             rank=rank,
             world_size=world_size,
-            model_size=self.config.model_size,
+            model_size=model_size,
+            vocab_size=vocab_size_override,  # Pass vocab_size from HuggingFace tokenizer
             device=self.config.device,
-            learning_rate=self.config.learning_rate,
-            compression=self.config.compression,
+            learning_rate=learning_rate,
+            compression=compression,
             latency_ms=0.0,  # No latency simulation
             shard_manager=self.shard_manager,
             telemetry_reporter=self.telemetry_reporter,
@@ -396,6 +435,9 @@ class WorkerClient:
             num_steps=num_steps or self.config.num_steps,
             checkpoint_interval=self.config.checkpoint_interval_steps
         )
+
+        # Store agreed_global_step for checkpoint saving in stop()
+        self._agreed_global_step = results.get('agreed_global_step')
 
         logger.info("")
         logger.info("=" * 60)

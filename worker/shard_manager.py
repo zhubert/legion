@@ -33,7 +33,10 @@ class ShardManager:
         shard_start: int,
         shard_end: int,
         device: str = "cpu",
-        checkpoint_dir: str = "./checkpoints"
+        checkpoint_dir: str = "./checkpoints",
+        rank: int = 0,
+        world_size: int = 1,
+        partition: Optional[ParameterPartition] = None
     ):
         """
         Initialize shard manager.
@@ -45,6 +48,9 @@ class ShardManager:
             shard_end: End index of parameter shard
             device: Device to store parameters ('cpu' or 'cuda')
             checkpoint_dir: Directory for checkpoints
+            rank: Worker rank in the training group
+            world_size: Total number of workers
+            partition: Optional pre-computed ParameterPartition
         """
         self.worker_id = worker_id
         self.model = model
@@ -52,18 +58,23 @@ class ShardManager:
         self.shard_end = shard_end
         self.device = device
         self.checkpoint_dir = Path(checkpoint_dir)
+        self.rank = rank
+        self.world_size = world_size
 
         # Create checkpoint directory
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        # Create partition info
-        self.partition = ParameterPartition(
-            rank=0,  # Not used for single shard
-            world_size=1,  # Single worker for now
-            param_names=[],  # Will be populated during load
-            start_idx=shard_start,
-            end_idx=shard_end
-        )
+        # Use provided partition or create default
+        if partition is not None:
+            self.partition = partition
+        else:
+            self.partition = ParameterPartition(
+                rank=rank,
+                world_size=world_size,
+                param_names=[],  # Will be populated during load
+                start_idx=shard_start,
+                end_idx=shard_end
+            )
 
         # Shard state
         self._shard_loaded = False
@@ -183,7 +194,7 @@ class ShardManager:
         keep_last_n: int = 3
     ) -> str:
         """
-        Save checkpoint.
+        Save checkpoint (legacy method - saves to worker-specific file).
 
         Args:
             global_step: Current training step
@@ -221,6 +232,79 @@ class ShardManager:
         self._cleanup_old_checkpoints(keep_last_n)
 
         return str(checkpoint_path)
+
+    def save_shard_to_checkpoint(
+        self,
+        checkpoint_dir: str,
+        global_step: int,
+        rank: int,
+        model_config: Optional[Dict[str, Any]] = None,
+        optimizer_state: Optional[Dict] = None
+    ) -> str:
+        """
+        Save shard to a shared checkpoint directory for assembly.
+
+        This method saves the worker's parameter shard with full metadata needed
+        for checkpoint assembly. Unlike save_checkpoint(), this creates a
+        standardized format that the assembler can use to reconstruct the full model.
+
+        Args:
+            checkpoint_dir: Base checkpoint directory (e.g., './checkpoints')
+            global_step: Current training step
+            rank: Worker's rank in the training group
+            model_config: Optional model configuration metadata
+            optimizer_state: Optional optimizer state
+
+        Returns:
+            Path to saved shard file
+
+        Raises:
+            RuntimeError: If shard not loaded
+        """
+        if not self._shard_loaded or self._owned_parameters is None:
+            raise RuntimeError("Shard not loaded. Call load_shard() first.")
+
+        # Create step-specific checkpoint directory
+        step_dir = Path(checkpoint_dir) / f"step_{global_step}"
+        step_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create shard filename
+        shard_name = f"shard_rank_{rank}.pt"
+        shard_path = step_dir / shard_name
+
+        # Build shard data with full partition metadata
+        shard_data = {
+            # Identification
+            'worker_id': self.worker_id,
+            'rank': rank,
+            'global_step': global_step,
+
+            # Parameter data
+            'parameters': self._owned_parameters.cpu(),
+            'optimizer_state': optimizer_state,
+
+            # Partition metadata (critical for assembly)
+            'partition': {
+                'shard_start': self.shard_start,
+                'shard_end': self.shard_end,
+                'num_params': self.shard_end - self.shard_start,
+                'param_names': self.partition.param_names,
+                'param_slices': self.partition.param_slices,
+                'world_size': self.partition.world_size,
+            },
+
+            # Model configuration (for validation)
+            'model_config': model_config,
+        }
+
+        # Save shard
+        torch.save(shard_data, shard_path)
+        logger.info(
+            f"Shard saved to checkpoint: {shard_path} "
+            f"(rank={rank}, params={self.shard_end - self.shard_start})"
+        )
+
+        return str(shard_path)
 
     def _cleanup_old_checkpoints(self, keep_last_n: int):
         """
@@ -303,3 +387,22 @@ class ShardManager:
             True if shard loaded, False otherwise
         """
         return self._shard_loaded
+
+    def update_partition_info(self, partition: ParameterPartition):
+        """
+        Update partition information after initialization.
+
+        This is called by the trainer after the Partitioner creates the actual
+        parameter partitions. The ShardManager is initially created with placeholder
+        ranges (0, total_params), then updated with the real partition info.
+
+        Args:
+            partition: The actual ParameterPartition for this worker
+        """
+        self.partition = partition
+        self.shard_start = partition.start_idx
+        self.shard_end = partition.end_idx
+        logger.info(
+            f"Updated partition info: shard=[{self.shard_start}:{self.shard_end}] "
+            f"({self.shard_end - self.shard_start} params)"
+        )

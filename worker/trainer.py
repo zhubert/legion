@@ -41,6 +41,7 @@ class DistributedTrainer:
         rank: int,
         world_size: int,
         model_size: str = "tiny",
+        vocab_size: Optional[int] = None,
         device: str = "cpu",
         learning_rate: float = 0.001,
         compression: str = "none",
@@ -60,6 +61,7 @@ class DistributedTrainer:
             rank: Worker rank in cluster
             world_size: Total number of workers
             model_size: Model size ('tiny', 'small', 'medium')
+            vocab_size: Optional vocabulary size (for HuggingFace tokenizers)
             device: Device to use ('cpu' or 'cuda')
             learning_rate: Learning rate
             compression: Compression method ('none', 'int8', 'topk')
@@ -74,6 +76,7 @@ class DistributedTrainer:
         self.rank = rank
         self.world_size = world_size
         self.model_size = model_size
+        self.vocab_size = vocab_size
         self.device = device
         self.learning_rate = learning_rate
         self.compression = compression
@@ -121,15 +124,23 @@ class DistributedTrainer:
             logger.warning("Trainer already set up")
             return
 
-        # Create model
-        logger.info(f"Creating {self.model_size} model...")
-        self.model = create_model(self.model_size)
+        # Create model (with vocab_size from tokenizer if available)
+        if self.vocab_size:
+            logger.info(f"Creating {self.model_size} model with vocab_size={self.vocab_size}...")
+        else:
+            logger.info(f"Creating {self.model_size} model...")
+        self.model = create_model(self.model_size, vocab_size=self.vocab_size)
         logger.info(f"Model parameters: {self.model.count_parameters():,}")
 
         # Partition model across workers
         logger.info(f"Partitioning model across {self.world_size} workers...")
         self.partitioner = Partitioner(self.model, world_size=self.world_size)
         self.partitioner.print_partition_info()
+
+        # Update shard manager with actual partition info
+        if self.shard_manager:
+            my_partition = self.partitioner.get_partition(self.rank)
+            self.shard_manager.update_partition_info(my_partition)
 
         # Create collective communication coordinator
         logger.info("Setting up collective communication...")
@@ -156,6 +167,20 @@ class DistributedTrainer:
             if self.grpc_server:
                 self.grpc_server.servicer.set_world_size(self.world_size)
                 self.grpc_server.servicer.set_aggregation_threshold(0.75)  # 75% threshold
+
+                # Initialize parameter store with owned parameters
+                logger.info("Loading owned parameters into gRPC server...")
+                my_partition = self.partitioner.get_partition(self.rank)
+                loaded_count = 0
+                for name, param in self.model.named_parameters():
+                    # Check if this worker owns any part of this parameter
+                    if name in my_partition.param_slices:
+                        # This worker owns (part of) this parameter - add to parameter store
+                        self.grpc_server.update_parameters(name, param.detach().cpu())
+                        logger.debug(f"  Loaded parameter: {name} ({param.numel()} elements)")
+                        loaded_count += 1
+                logger.info(f"Loaded {loaded_count} parameters into gRPC server")
+
                 logger.info(f"gRPC server configured: world_size={self.world_size}, threshold=75%")
 
             # For gRPC mode, we still need a collective coordinator for simulation compatibility
@@ -292,10 +317,14 @@ class DistributedTrainer:
             # Save checkpoint
             if self.shard_manager and (step + 1) % checkpoint_interval == 0:
                 try:
-                    checkpoint_path = self.shard_manager.save_checkpoint(
-                        global_step=step + 1
+                    # Save distributed checkpoint (worker shard only)
+                    shard_path = await self.save_distributed_checkpoint(
+                        global_step=step + 1,
+                        checkpoint_dir="./checkpoints",
+                        model_metadata={'model_size': self.model_size}
                     )
-                    logger.info(f"Checkpoint saved: {checkpoint_path}")
+                    if shard_path:
+                        logger.info(f"Distributed checkpoint shard saved: {shard_path}")
                 except Exception as e:
                     logger.error(f"Failed to save checkpoint: {e}")
 
@@ -376,10 +405,13 @@ class DistributedTrainer:
             targets = targets.to(self.device)
 
             # === PHASE 1: Check bounded staleness and get backup assignment ===
-            if self.coordinator_client:
+            # Update coordinator every 5 steps to reduce overhead
+            VERSION_UPDATE_INTERVAL = 5
+            if self.coordinator_client and step % VERSION_UPDATE_INTERVAL == 0:
                 # Report current version to coordinator
-                version_response = await self.coordinator_client.http_client.post(
-                    f"{self.coordinator_client.base_url}/training/version/update",
+                version_response = await self.coordinator_client._request_with_retry(
+                    "POST",
+                    "/training/version/update",
                     json={
                         "worker_id": self.worker_id,
                         "version": step,
@@ -439,7 +471,9 @@ class DistributedTrainer:
                         # Extract param name from key (format: "param_name[start:end]")
                         param_name = param_key.split('[')[0]
                         if param_name in dict(self.model.named_parameters()):
-                            self.model.state_dict()[param_name].copy_(param_tensor)
+                            # Move parameter to model's device before copying
+                            param_tensor_device = param_tensor.to(self.device)
+                            self.model.state_dict()[param_name].copy_(param_tensor_device)
             load_time = time.time() - load_start
 
             # === PHASE 4: Forward pass ===
@@ -489,7 +523,8 @@ class DistributedTrainer:
                     if aggregated_grad is not None:
                         # Apply aggregated gradient to parameter
                         param = dict(self.model.named_parameters())[param_name]
-                        param.grad = aggregated_grad
+                        # Move gradient to same device as parameter
+                        param.grad = aggregated_grad.to(param.device)
 
             aggregation_time = time.time() - aggregation_start
 
@@ -501,7 +536,8 @@ class DistributedTrainer:
             # === PHASE 9: Update parameter server with new values ===
             for name, param in self.model.named_parameters():
                 if self._get_param_owner_rank(name) == self.rank:
-                    self.grpc_server.update_parameters(name, param.data)
+                    # Move to CPU for gRPC server storage
+                    self.grpc_server.update_parameters(name, param.detach().cpu())
 
             # Calculate throughput
             step_time = time.time() - step_start
@@ -558,10 +594,14 @@ class DistributedTrainer:
             # Save checkpoint
             if self.shard_manager and (step + 1) % checkpoint_interval == 0:
                 try:
-                    checkpoint_path = self.shard_manager.save_checkpoint(
-                        global_step=step + 1
+                    # Save distributed checkpoint (worker shard only)
+                    shard_path = await self.save_distributed_checkpoint(
+                        global_step=step + 1,
+                        checkpoint_dir="./checkpoints",
+                        model_metadata={'model_size': self.model_size}
                     )
-                    logger.info(f"Checkpoint saved: {checkpoint_path}")
+                    if shard_path:
+                        logger.info(f"Distributed checkpoint shard saved: {shard_path}")
                 except Exception as e:
                     logger.error(f"Failed to save checkpoint: {e}")
 
@@ -586,16 +626,36 @@ class DistributedTrainer:
             f"({results['steps_per_sec']:.2f} steps/s)"
         )
 
-        # Distributed barrier: wait for all workers to finish training
+        # Save checkpoint shard BEFORE barrier so all shards are ready when assembler runs
+        if self.shard_manager and self.shard_manager.is_loaded():
+            logger.info(f"Rank {self.rank}: Saving checkpoint shard...")
+            try:
+                shard_path = self.shard_manager.save_shard_to_checkpoint(
+                    checkpoint_dir="./checkpoints",
+                    global_step=num_steps,
+                    rank=self.rank,
+                    model_config=None,
+                    optimizer_state=None
+                )
+                logger.info(f"Rank {self.rank}: ✓ Checkpoint shard saved: {shard_path}")
+            except Exception as e:
+                logger.error(f"Rank {self.rank}: Failed to save checkpoint shard: {e}")
+
+        # Distributed barrier: wait for all workers to finish training AND save checkpoints
+        agreed_global_step = num_steps  # Default to requested num_steps
         if self.coordinator_client:
             logger.info(f"Rank {self.rank} finished training, waiting at barrier...")
-            barrier_success = await self.coordinator_client.wait_at_barrier(
+            barrier_success, barrier_global_step = await self.coordinator_client.wait_at_barrier(
                 step="training_complete",
+                global_step=num_steps,  # Pass final step for checkpoint assembly
                 poll_interval=5.0,
                 timeout=300.0  # 5 minutes
             )
             if barrier_success:
-                logger.info(f"Rank {self.rank} barrier complete, all workers finished")
+                # Use the agreed-upon global_step from barrier (all workers agree)
+                if barrier_global_step is not None:
+                    agreed_global_step = barrier_global_step
+                logger.info(f"Rank {self.rank} barrier complete, all workers finished (global_step={agreed_global_step})")
             else:
                 logger.warning(f"Rank {self.rank} barrier timeout")
         else:
@@ -603,6 +663,8 @@ class DistributedTrainer:
             logger.info(f"Rank {self.rank} finished, waiting 10s for peers...")
             await asyncio.sleep(10)
 
+        # Include agreed global_step in results for checkpoint saving
+        results['agreed_global_step'] = agreed_global_step
         return results
 
     async def _compute_backup_gradients(
@@ -651,7 +713,9 @@ class DistributedTrainer:
                     if param_tensor is not None:
                         param_name = param_key.split('[')[0]
                         if param_name in dict(self.model.named_parameters()):
-                            self.model.state_dict()[param_name].copy_(param_tensor)
+                            # Move parameter to model's device before copying
+                            param_tensor_device = param_tensor.to(self.device)
+                            self.model.state_dict()[param_name].copy_(param_tensor_device)
 
             # 3. Forward pass with slow worker's batch (we use our own batch as proxy)
             # TODO: Ideally fetch the slow worker's actual batch for this version
@@ -689,6 +753,45 @@ class DistributedTrainer:
 
         except Exception as e:
             logger.error(f"Failed to compute backup gradients for {backup_worker_id}: {e}")
+
+    async def save_distributed_checkpoint(
+        self,
+        global_step: int,
+        checkpoint_dir: str = "./checkpoints",
+        model_metadata: Optional[Dict[str, Any]] = None
+    ) -> Optional[str]:
+        """
+        Save distributed checkpoint shard for this worker.
+
+        This method saves the worker's parameter shard with full metadata
+        needed for checkpoint assembly. The coordinator will later trigger
+        assembly of the complete model.
+
+        Args:
+            global_step: Current training step
+            checkpoint_dir: Base checkpoint directory
+            model_metadata: Optional model configuration metadata
+
+        Returns:
+            Path to saved shard file, or None if save failed
+        """
+        if not self.shard_manager:
+            logger.warning("No shard manager available, skipping distributed checkpoint")
+            return None
+
+        try:
+            shard_path = self.shard_manager.save_shard_to_checkpoint(
+                checkpoint_dir=checkpoint_dir,
+                global_step=global_step,
+                rank=self.rank,
+                model_config=model_metadata
+            )
+            logger.info(f"Distributed checkpoint saved: {shard_path}")
+            return shard_path
+
+        except Exception as e:
+            logger.error(f"Failed to save distributed checkpoint: {e}")
+            return None
 
     def get_worker_stats(self) -> Dict[str, Any]:
         """

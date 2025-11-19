@@ -168,7 +168,7 @@ DATASET_CONFIGS = {
         'description': 'The Pile: 825GB diverse dataset (22 sources)'
     },
     'tiny_shakespeare': {
-        'full_name': 'karpathy/tiny_shakespeare',
+        'full_name': 'winglian/tiny-shakespeare',
         'streaming': False,  # Small dataset, can load fully
         'buffer_size': 1_000,
         'tokenizer': 'gpt2',
@@ -227,7 +227,7 @@ def create_huggingface_dataset(
     streaming: Optional[bool] = None,
     seed: int = 42,
     buffer_size: Optional[int] = None,
-) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+) -> Tuple[List[Tuple[torch.Tensor, torch.Tensor]], int]:
     """
     Create HuggingFace dataset shard for distributed training.
 
@@ -248,17 +248,19 @@ def create_huggingface_dataset(
         buffer_size: Shuffle buffer size override
 
     Returns:
-        List of (input_ids, labels) batches for this worker
+        Tuple of (batches, vocab_size) where:
+        - batches: List of (input_ids, labels) batches for this worker
+        - vocab_size: Size of the tokenizer vocabulary
 
     Example:
-        >>> dataset = create_huggingface_dataset(
+        >>> dataset, vocab_size = create_huggingface_dataset(
         ...     dataset_name='fineweb-edu',
         ...     rank=0,
         ...     world_size=4,
         ...     num_batches=100,
         ...     batch_size=8
         ... )
-        >>> print(f"Loaded {len(dataset)} batches")
+        >>> print(f"Loaded {len(dataset)} batches with vocab_size={vocab_size}")
 
     Note:
         Requires: pip install datasets transformers
@@ -303,7 +305,11 @@ def create_huggingface_dataset(
     )
 
     # Shuffle with consistent seed across all workers
-    dataset = dataset.shuffle(seed=seed, buffer_size=config['buffer_size'])
+    # Note: buffer_size is only valid for streaming datasets
+    if config['streaming']:
+        dataset = dataset.shuffle(seed=seed, buffer_size=config['buffer_size'])
+    else:
+        dataset = dataset.shuffle(seed=seed)
 
     # Shard by worker rank (each worker gets every world_size-th sample)
     dataset = dataset.shard(num_shards=world_size, index=rank)
@@ -384,7 +390,11 @@ def create_huggingface_dataset(
         f"(effective global batch size: {batch_size * world_size})"
     )
 
-    return batches
+    # Return batches and vocab_size (for model creation)
+    vocab_size = len(tokenizer)
+    logger.info(f"Tokenizer vocab_size: {vocab_size}")
+
+    return batches, vocab_size
 
 
 def list_available_datasets() -> List[Dict[str, str]]:

@@ -23,6 +23,7 @@ from coordinator.database import Database
 from coordinator.registry import WorkerRegistry
 from coordinator.clustering import ClusterManager
 from coordinator.version_manager import VersionManager
+from coordinator.training_config import TrainingConfig, TrainingConfigManager
 
 
 # Configure logging
@@ -84,6 +85,7 @@ class VersionUpdate(BaseModel):
     """Worker version update."""
     worker_id: str = Field(..., description="Worker identifier")
     version: int = Field(..., description="Current training step version", ge=0)
+    is_healthy: bool = Field(default=True, description="Worker health status")
 
 
 # WebSocket connection manager
@@ -124,6 +126,7 @@ class ConnectionManager:
 db: Optional[Database] = None
 registry: Optional[WorkerRegistry] = None
 cluster_manager: Optional[ClusterManager] = None
+training_config_manager: Optional[TrainingConfigManager] = None
 ws_manager: ConnectionManager = ConnectionManager()
 
 
@@ -155,7 +158,7 @@ async def heartbeat_monitor():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan (startup/shutdown)."""
-    global db, registry, cluster_manager, version_manager
+    global db, registry, cluster_manager, version_manager, training_config_manager
 
     # Startup
     logger.info("Starting coordinator server...")
@@ -163,6 +166,26 @@ async def lifespan(app: FastAPI):
     registry = WorkerRegistry(db, heartbeat_timeout=90)
     cluster_manager = ClusterManager(latency_threshold_ms=50.0)
     version_manager = VersionManager(staleness_bound=5)
+    training_config_manager = TrainingConfigManager()
+
+    # Clean up stale workers from previous runs (> 5 minutes old)
+    from datetime import datetime, timedelta
+    stale_workers = []
+    for worker in db.get_all_workers():
+        if worker['last_heartbeat']:
+            try:
+                last_heartbeat = datetime.fromisoformat(worker['last_heartbeat'])
+                if datetime.now() - last_heartbeat > timedelta(minutes=5):
+                    stale_workers.append(worker['worker_id'])
+            except:
+                pass
+
+    for worker_id in stale_workers:
+        logger.info(f"Removing stale worker from previous run: {worker_id}")
+        db.delete_worker(worker_id)
+
+    if stale_workers:
+        logger.info(f"Cleaned up {len(stale_workers)} stale workers")
 
     # Start background tasks
     heartbeat_task = asyncio.create_task(heartbeat_monitor())
@@ -493,7 +516,12 @@ async def get_metrics(limit: int = 100):
 
 
 @app.post("/training/barrier")
-async def training_barrier(worker_id: str, step: str = "training_complete"):
+async def training_barrier(
+    worker_id: str,
+    step: str = "training_complete",
+    global_step: Optional[int] = None,
+    background_tasks: BackgroundTasks = None
+):
     """
     Distributed barrier synchronization for workers.
 
@@ -503,6 +531,7 @@ async def training_barrier(worker_id: str, step: str = "training_complete"):
     Args:
     - worker_id: ID of worker reaching barrier
     - step: Barrier step name (default: "training_complete")
+    - global_step: Training step number (used for checkpoint creation)
 
     Returns:
     - reached: Number of workers at this barrier
@@ -530,6 +559,11 @@ async def training_barrier(worker_id: str, step: str = "training_complete"):
             status="waiting"
         )
         arrived_workers = {worker_id}
+        # Store global_step in barrier metadata if provided
+        if global_step is not None:
+            barrier_global_step = global_step
+        else:
+            barrier_global_step = None
     else:
         # Update existing barrier
         arrived_workers = set(barrier['arrived_workers'])
@@ -541,6 +575,8 @@ async def training_barrier(worker_id: str, step: str = "training_complete"):
             arrived_workers=sorted(list(arrived_workers)),
             status="waiting" if len(arrived_workers) < total_workers else "complete"
         )
+        # Use global_step from barrier if not provided
+        barrier_global_step = global_step if global_step is not None else barrier.get('global_step')
 
     reached = len(arrived_workers)
     all_ready = reached >= total_workers
@@ -550,8 +586,59 @@ async def training_barrier(worker_id: str, step: str = "training_complete"):
         f"({reached}/{total_workers} workers)"
     )
 
-    # Cleanup if all workers reached
-    if all_ready:
+    # Trigger checkpoint assembly when training_complete barrier is reached
+    if all_ready and step == "training_complete" and barrier_global_step is not None:
+        logger.info(
+            f"Barrier '{step}' complete, all {total_workers} workers ready. "
+            f"Triggering checkpoint assembly at step {barrier_global_step}"
+        )
+
+        # Create checkpoint metadata before broadcasting assembly request
+        # Only create if it doesn't already exist (prevents overwriting with fewer workers)
+        try:
+            from pathlib import Path
+            from worker.assembler import create_checkpoint_metadata
+
+            metadata_path = Path("./checkpoints") / f"step_{barrier_global_step}" / "metadata.json"
+
+            if not metadata_path.exists():
+                # Build worker info for metadata using workers that reached the barrier
+                # Use worker_ids_list which is the consistent ordering from the barrier
+                worker_metadata = []
+                for idx, worker_id in enumerate(worker_ids_list):
+                    worker_metadata.append({
+                        'rank': idx,
+                        'worker_id': worker_id,
+                        'shard_file': f"shard_rank_{idx}.pt"
+                    })
+
+                # Create metadata.json
+                metadata_path_str = create_checkpoint_metadata(
+                    checkpoint_dir="./checkpoints",
+                    global_step=barrier_global_step,
+                    workers=worker_metadata,
+                    model_config=None  # TODO: Get from training config
+                )
+                logger.info(f"Created checkpoint metadata: {metadata_path_str} with {len(worker_metadata)} workers")
+            else:
+                logger.info(f"Checkpoint metadata already exists: {metadata_path}, skipping creation")
+
+        except Exception as e:
+            logger.error(f"Failed to create checkpoint metadata: {e}")
+            # Continue with assembly anyway - assembler will fail with clear error
+
+        # Broadcast checkpoint assembly request to assembler service
+        await ws_manager.broadcast({
+            'event': 'assemble_checkpoint',
+            'global_step': barrier_global_step,
+            'num_workers': total_workers,
+            'worker_ids': worker_ids_list
+        })
+
+        logger.info(f"Checkpoint assembly request broadcast for step {barrier_global_step}")
+
+        db.delete_barrier(barrier_id)
+    elif all_ready:
         logger.info(f"Barrier '{step}' complete, all {total_workers} workers ready")
         db.delete_barrier(barrier_id)
 
@@ -559,7 +646,8 @@ async def training_barrier(worker_id: str, step: str = "training_complete"):
         "reached": reached,
         "total": total_workers,
         "all_ready": all_ready,
-        "waiting_for": list(worker_ids - arrived_workers) if not all_ready else []
+        "waiting_for": list(worker_ids - arrived_workers) if not all_ready else [],
+        "global_step": barrier_global_step if all_ready else None
     }
 
 
@@ -630,8 +718,12 @@ async def update_worker_version(version_update: VersionUpdate):
     - backup_assignment: Worker ID to help (if ahead), or null
     """
     # Update version in version manager
+    # Use provided is_healthy, but override if worker is offline in registry
     worker_info = registry.get_worker(version_update.worker_id)
-    is_healthy = worker_info.status == "online" if worker_info else False
+    if worker_info and worker_info.status != "online":
+        is_healthy = False
+    else:
+        is_healthy = version_update.is_healthy
 
     version_manager.update_worker_version(
         worker_id=version_update.worker_id,
@@ -656,6 +748,9 @@ async def update_worker_version(version_update: VersionUpdate):
     )
 
     return {
+        "status": "success",
+        "worker_id": version_update.worker_id,
+        "version": version_update.version,
         "global_version": global_version,
         "worker_version": version_update.version,
         "is_ahead": is_ahead,
@@ -790,6 +885,308 @@ async def assign_backup_work():
     }
 
 
+# Checkpoint endpoints
+
+class CheckpointCreateRequest(BaseModel):
+    """Request to create a checkpoint."""
+    global_step: int = Field(..., description="Training step to checkpoint", ge=0)
+    checkpoint_dir: str = Field(default="./checkpoints", description="Base checkpoint directory")
+    model_metadata: Optional[Dict[str, Any]] = Field(None, description="Optional model configuration metadata")
+    assemble: bool = Field(default=True, description="Whether to assemble checkpoint after saving shards")
+
+
+@app.post("/checkpoint/create")
+async def create_checkpoint(request: CheckpointCreateRequest, background_tasks: BackgroundTasks):
+    """
+    Trigger checkpoint creation across all workers.
+
+    This endpoint:
+    1. Gets list of all online workers
+    2. Broadcasts checkpoint request via WebSocket
+    3. Creates metadata.json with worker info
+    4. Optionally triggers assembler in background
+
+    Returns checkpoint ID for tracking.
+    """
+    import uuid
+    import json
+    from pathlib import Path
+    from worker.assembler import create_checkpoint_metadata
+
+    # Get online workers
+    workers = registry.get_workers()
+    if not workers:
+        raise HTTPException(status_code=400, detail="No workers online to checkpoint")
+
+    # Generate checkpoint ID
+    checkpoint_id = f"ckpt_{request.global_step}_{uuid.uuid4().hex[:8]}"
+
+    # Prepare worker info for metadata
+    worker_info = []
+    for worker in workers:
+        rank = workers.index(worker)  # Use position as rank
+        worker_info.append({
+            'rank': rank,
+            'worker_id': worker.worker_id,
+            'shard_file': f"shard_rank_{rank}.pt",
+            'shard_start': worker.shard_start,
+            'shard_end': worker.shard_end
+        })
+
+    # Save checkpoint metadata to database
+    worker_shards = {
+        w['worker_id']: {
+            'rank': w['rank'],
+            'shard_start': w['shard_start'],
+            'shard_end': w['shard_end']
+        }
+        for w in worker_info
+    }
+
+    db.save_checkpoint_metadata(
+        checkpoint_id=checkpoint_id,
+        version=1,
+        global_step=request.global_step,
+        worker_shards=worker_shards,
+        metadata=request.model_metadata
+    )
+
+    # Create checkpoint metadata file
+    try:
+        create_checkpoint_metadata(
+            checkpoint_dir=request.checkpoint_dir,
+            global_step=request.global_step,
+            workers=worker_info,
+            model_config=request.model_metadata
+        )
+    except Exception as e:
+        logger.error(f"Failed to create checkpoint metadata: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create checkpoint metadata: {e}")
+
+    # Broadcast checkpoint request to workers
+    await ws_manager.broadcast({
+        'event': 'checkpoint_request',
+        'checkpoint_id': checkpoint_id,
+        'global_step': request.global_step,
+        'checkpoint_dir': request.checkpoint_dir,
+        'workers': worker_info
+    })
+
+    logger.info(
+        f"Checkpoint request broadcast: step={request.global_step}, "
+        f"workers={len(workers)}, checkpoint_id={checkpoint_id}"
+    )
+
+    # Update status to shards_saved (workers will save in background)
+    db.update_checkpoint_status(checkpoint_id, "shards_saved")
+
+    # Optionally trigger assembly in background
+    if request.assemble:
+        background_tasks.add_task(
+            assemble_checkpoint_task,
+            request.checkpoint_dir,
+            request.global_step,
+            checkpoint_id
+        )
+
+    return {
+        "checkpoint_id": checkpoint_id,
+        "global_step": request.global_step,
+        "num_workers": len(workers),
+        "status": "shards_saving",
+        "will_assemble": request.assemble
+    }
+
+
+async def assemble_checkpoint_task(
+    checkpoint_dir: str,
+    global_step: int,
+    checkpoint_id: str
+):
+    """
+    Background task to assemble checkpoint from shards.
+
+    Args:
+        checkpoint_dir: Base checkpoint directory
+        global_step: Training step
+        checkpoint_id: Checkpoint ID for tracking
+    """
+    import asyncio
+    from worker.assembler import CheckpointAssembler
+
+    # Wait a bit for workers to save shards
+    await asyncio.sleep(5)
+
+    try:
+        db.update_checkpoint_status(checkpoint_id, "assembling")
+
+        assembler = CheckpointAssembler(checkpoint_dir)
+        output_path = assembler.assemble_checkpoint(global_step)
+
+        db.update_checkpoint_status(checkpoint_id, "assembled", output_path)
+
+        # Broadcast completion
+        await ws_manager.broadcast({
+            'event': 'checkpoint_assembled',
+            'checkpoint_id': checkpoint_id,
+            'global_step': global_step,
+            'output_path': output_path
+        })
+
+        logger.info(f"Checkpoint assembled: {output_path}")
+
+    except Exception as e:
+        logger.error(f"Failed to assemble checkpoint: {e}")
+        db.update_checkpoint_status(checkpoint_id, "failed")
+
+        await ws_manager.broadcast({
+            'event': 'checkpoint_failed',
+            'checkpoint_id': checkpoint_id,
+            'global_step': global_step,
+            'error': str(e)
+        })
+
+
+@app.get("/checkpoint/{global_step}/status")
+async def get_checkpoint_status(global_step: int):
+    """
+    Get status of a checkpoint by global step.
+
+    Returns checkpoint information including assembly status.
+    """
+    checkpoint = db.get_checkpoint_by_step(global_step)
+
+    if not checkpoint:
+        raise HTTPException(status_code=404, detail=f"Checkpoint not found for step {global_step}")
+
+    return checkpoint
+
+
+@app.get("/checkpoints")
+async def list_checkpoints():
+    """
+    List all checkpoints.
+
+    Returns list of checkpoint info sorted by global step (newest first).
+    """
+    checkpoints = db.list_checkpoints()
+    return {
+        "checkpoints": checkpoints,
+        "count": len(checkpoints)
+    }
+
+
+@app.get("/training/config")
+async def get_training_config():
+    """
+    Get current global training configuration.
+
+    Returns the training configuration that all workers should follow.
+    """
+    return training_config_manager.to_dict()
+
+
+@app.put("/training/config")
+async def update_training_config(updates: Dict[str, Any]):
+    """
+    Update global training configuration.
+
+    Args:
+        updates: Dictionary of configuration fields to update
+
+    Returns:
+        Updated configuration or error if validation fails
+    """
+    errors = training_config_manager.update_config(updates)
+
+    if errors:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "Invalid configuration", "errors": errors}
+        )
+
+    # Broadcast configuration update to workers
+    await ws_manager.broadcast({
+        'event': 'training_config_updated',
+        'config': training_config_manager.to_dict()
+    })
+
+    return {
+        "message": "Training configuration updated",
+        "config": training_config_manager.to_dict()
+    }
+
+
+@app.get("/training/config/worker/{worker_id}")
+async def get_worker_training_config(worker_id: str):
+    """
+    Get training configuration assignment for a specific worker.
+
+    This includes rank, world_size, and any worker-specific overrides
+    (e.g., custom batch size based on hardware).
+
+    Args:
+        worker_id: Worker identifier
+
+    Returns:
+        Training configuration customized for this worker
+    """
+    # Get worker info to determine rank
+    worker = registry.get_worker(worker_id)
+    if not worker:
+        raise HTTPException(status_code=404, detail=f"Worker {worker_id} not found")
+
+    # Get online workers to determine rank and world_size
+    workers = registry.get_online_workers()
+
+    # Sort workers by worker_id to ensure consistent rank assignment
+    workers = sorted(workers, key=lambda w: w.worker_id)
+
+    # Find rank
+    rank = next((i for i, w in enumerate(workers) if w.worker_id == worker_id), 0)
+    world_size = len(workers)
+
+    # Get configuration with worker-specific settings
+    config = training_config_manager.get_worker_assignment(
+        worker_id=worker_id,
+        rank=rank,
+        world_size=world_size
+    )
+
+    return {
+        "worker_id": worker_id,
+        "rank": rank,
+        "world_size": world_size,
+        "config": config
+    }
+
+
+@app.put("/training/config/worker/{worker_id}/batch_size")
+async def set_worker_batch_size(worker_id: str, batch_size: int):
+    """
+    Set custom batch size for a worker based on its hardware capabilities.
+
+    Args:
+        worker_id: Worker identifier
+        batch_size: Custom batch size for this worker
+
+    Returns:
+        Updated worker configuration
+    """
+    if batch_size <= 0:
+        raise HTTPException(status_code=400, detail="batch_size must be positive")
+
+    training_config_manager.set_worker_batch_size(worker_id, batch_size)
+
+    logger.info(f"Set batch size for worker {worker_id}: {batch_size}")
+
+    return {
+        "message": f"Batch size set for worker {worker_id}",
+        "worker_id": worker_id,
+        "batch_size": batch_size
+    }
+
+
 @app.websocket("/ws/events")
 async def websocket_endpoint(websocket: WebSocket):
     """
@@ -801,6 +1198,10 @@ async def websocket_endpoint(websocket: WebSocket):
     - worker_offline: Worker marked offline (stale heartbeat)
     - clusters_updated: Cluster assignments updated
     - metric_update: New training metric
+    - checkpoint_request: Coordinator requests workers save checkpoint
+    - checkpoint_assembled: Checkpoint assembly completed
+    - checkpoint_failed: Checkpoint assembly failed
+    - training_config_updated: Training configuration updated
     """
     await ws_manager.connect(websocket)
 

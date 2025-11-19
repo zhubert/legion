@@ -206,12 +206,15 @@ class TinyGPT(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
-def create_model(size: str = "tiny") -> TinyGPT:
+def create_model(size: str = "tiny", vocab_size: int = None) -> TinyGPT:
     """
     Factory function to create models of different sizes
 
     Args:
         size: One of 'tiny', 'small', 'medium', 'large'
+        vocab_size: Optional vocabulary size override. If provided, overrides
+                   the default vocab_size for the given model size. This is
+                   necessary when using real tokenizers (e.g., GPT-2 has 50257 tokens).
 
     Returns:
         TinyGPT model
@@ -251,6 +254,11 @@ def create_model(size: str = "tiny") -> TinyGPT:
         raise ValueError(f"Unknown size '{size}'. Choose from: {list(configs.keys())}")
 
     config = configs[size]
+
+    # Override vocab_size if provided (for real tokenizers)
+    if vocab_size is not None:
+        config['vocab_size'] = vocab_size
+
     model = TinyGPT(**config)
 
     print(f"\nCreated {size} model:")

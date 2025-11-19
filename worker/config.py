@@ -40,6 +40,32 @@ def get_hostname() -> str:
     return socket.gethostname()
 
 
+def get_best_device() -> str:
+    """
+    Auto-detect the best available device.
+
+    Priority: cuda > mps > cpu
+
+    Returns:
+        Device string: "cuda", "mps", or "cpu"
+    """
+    try:
+        import torch
+
+        # Check CUDA first (NVIDIA GPUs)
+        if torch.cuda.is_available():
+            return "cuda"
+
+        # Check MPS (Apple Silicon)
+        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            return "mps"
+
+        # Fall back to CPU
+        return "cpu"
+    except ImportError:
+        return "cpu"
+
+
 @dataclass
 class WorkerConfig:
     """
@@ -63,10 +89,12 @@ class WorkerConfig:
 
     # Network settings
     ip_address: str = field(default_factory=get_local_ip)
-    port: int = 50051  # gRPC port for worker-to-worker (Phase 1.3)
+    port: int = field(
+        default_factory=lambda: int(os.environ.get('LEGION_WORKER_PORT', '50051'))
+    )  # gRPC port for worker-to-worker (Phase 1.3)
 
     # Hardware information
-    device: str = "cpu"  # "cpu" or "cuda"
+    device: str = field(default_factory=get_best_device)  # "cuda", "mps", or "cpu"
     cpu_cores: Optional[int] = None
     ram_gb: Optional[float] = None
     gpu_name: Optional[str] = None
@@ -110,10 +138,11 @@ class WorkerConfig:
 
     def __post_init__(self):
         """Validate and auto-detect hardware info."""
-        # Auto-detect hardware if not specified
+        # Auto-detect CPU cores
         if self.cpu_cores is None:
             self.cpu_cores = os.cpu_count() or 1
 
+        # Auto-detect RAM (needed for MPS memory estimation)
         if self.ram_gb is None:
             try:
                 import psutil
@@ -121,15 +150,22 @@ class WorkerConfig:
             except ImportError:
                 self.ram_gb = None
 
-        # Auto-detect GPU if device is cuda
-        if self.device == "cuda" and (self.gpu_name is None or self.gpu_memory_gb is None):
+        # Auto-detect GPU/accelerator info
+        if self.device in ["cuda", "mps"] and (self.gpu_name is None or self.gpu_memory_gb is None):
             try:
                 import torch
-                if torch.cuda.is_available():
+                if self.device == "cuda" and torch.cuda.is_available():
                     self.gpu_name = torch.cuda.get_device_name(0)
                     self.gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                elif self.device == "mps" and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                    # MPS doesn't have easy API for device name/memory
+                    if self.gpu_name is None:
+                        self.gpu_name = "Apple Silicon (MPS)"
+                    # Apple Silicon unified memory - use total RAM as estimate
+                    if self.gpu_memory_gb is None and self.ram_gb is not None:
+                        self.gpu_memory_gb = self.ram_gb
                 else:
-                    # Fall back to CPU if CUDA not available
+                    # Fall back to CPU if requested device not available
                     self.device = "cpu"
             except ImportError:
                 self.device = "cpu"
@@ -171,12 +207,12 @@ class WorkerConfig:
 
     def get_gpu_info(self) -> Optional[Dict[str, Any]]:
         """
-        Get GPU information dictionary for registration.
+        Get GPU/accelerator information dictionary for registration.
 
         Returns:
-            GPU info dict or None if no GPU
+            GPU info dict or None if no GPU/accelerator
         """
-        if self.device == "cuda" and self.gpu_name:
+        if self.device in ["cuda", "mps"] and self.gpu_name:
             return {
                 'name': self.gpu_name,
                 'memory_gb': self.gpu_memory_gb

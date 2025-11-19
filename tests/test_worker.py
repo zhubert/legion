@@ -38,7 +38,7 @@ class TestWorkerConfig:
         assert config.worker_id.startswith("worker_")
         assert config.coordinator_url == "http://localhost:8000"
         assert config.port == 50051
-        assert config.device in ["cpu", "cuda"]
+        assert config.device in ["cpu", "cuda", "mps"]
         assert config.heartbeat_interval == 30
         assert config.telemetry_enabled is True
 

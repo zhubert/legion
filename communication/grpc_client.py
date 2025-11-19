@@ -55,10 +55,19 @@ class WorkerGRPCClient:
             gRPC async channel
         """
         if worker_address not in self.channels:
-            # Configure channel with larger message sizes for parameter transfer
+            # Configure channel with larger message sizes and socket buffers for parameter transfer
             options = [
                 ('grpc.max_send_message_length', 100 * 1024 * 1024),  # 100MB
                 ('grpc.max_receive_message_length', 100 * 1024 * 1024),  # 100MB
+                # Increase TCP socket buffer sizes to prevent "Message too long" errors
+                ('grpc.http2.max_frame_size', 16 * 1024 * 1024),  # 16MB HTTP/2 frames
+                ('grpc.http2.min_recv_ping_interval_without_data_ms', 300000),  # 5 min keepalive
+                # Increase initial window sizes for large transfers
+                ('grpc.http2.initial_sequence_number', 0),
+                ('grpc.http2.max_pings_without_data', 0),  # Unlimited pings
+                ('grpc.http2.min_time_between_pings_ms', 10000),
+                ('grpc.http2.write_buffer_size', 32 * 1024 * 1024),  # 32MB write buffer
+                ('grpc.http2.bdp_probe', 1),  # Enable BDP probing
             ]
             self.channels[worker_address] = grpc.aio.insecure_channel(
                 worker_address,

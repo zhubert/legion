@@ -37,7 +37,7 @@ class TestDatasetConfiguration:
     def test_get_dataset_config_shakespeare(self):
         """Test Shakespeare configuration."""
         config = get_dataset_config('tiny_shakespeare')
-        assert config['full_name'] == 'karpathy/tiny_shakespeare'
+        assert config['full_name'] == 'winglian/tiny-shakespeare'
         assert config['streaming'] is False  # Small dataset
         assert config['seq_len'] == 256
 
@@ -79,15 +79,14 @@ class TestHuggingFaceDatasetLoading:
         except ImportError:
             pytest.skip("datasets and transformers not installed")
 
-    @pytest.mark.skipif(
-        True,  # Skip by default to avoid long download times
-        reason="Skipped to avoid downloading large datasets in CI"
-    )
     def test_load_tiny_shakespeare(self):
-        """Test loading tiny shakespeare dataset."""
+        """Test loading tiny shakespeare dataset (small enough to run in tests)."""
+        pytest.importorskip("datasets")
+        pytest.importorskip("transformers")
+
         from core.dataset import create_huggingface_dataset
 
-        dataset = create_huggingface_dataset(
+        dataset, vocab_size = create_huggingface_dataset(
             dataset_name='tiny_shakespeare',
             rank=0,
             world_size=1,
@@ -97,38 +96,57 @@ class TestHuggingFaceDatasetLoading:
         )
 
         assert len(dataset) == 5
+        assert vocab_size > 0  # GPT-2 tokenizer has 50257 tokens
         for inputs, labels in dataset:
             assert inputs.shape == (4, 128)
             assert labels.shape == (4, 128)
+            # Verify tokens are valid integers
+            assert inputs.dtype == labels.dtype
+            assert inputs.min() >= 0
+            assert inputs.max() < vocab_size  # All tokens should be within vocab
 
-    @pytest.mark.skipif(
-        True,  # Skip by default
-        reason="Skipped to avoid downloading large datasets in CI"
-    )
     def test_distributed_sharding(self):
         """Test that workers get non-overlapping shards."""
+        pytest.importorskip("datasets")
+        pytest.importorskip("transformers")
+
         from core.dataset import create_huggingface_dataset
 
-        world_size = 4
-        num_batches = 10
+        world_size = 2  # Reduced to 2 workers to speed up test
+        num_batches = 3  # Reduced to 3 batches
         batch_size = 4
 
         # Create datasets for all workers
-        datasets = [
+        results = [
             create_huggingface_dataset(
                 dataset_name='tiny_shakespeare',
                 rank=rank,
                 world_size=world_size,
                 num_batches=num_batches,
                 batch_size=batch_size,
-                seq_len=128
+                seq_len=128,
+                seed=42  # Fixed seed for reproducibility
             )
             for rank in range(world_size)
         ]
 
+        # Extract datasets and vocab_sizes
+        datasets = [dataset for dataset, _ in results]
+        vocab_sizes = [vocab_size for _, vocab_size in results]
+
         # Verify each worker got correct number of batches
         for dataset in datasets:
             assert len(dataset) == num_batches
+
+        # Verify all workers have the same vocab_size
+        assert len(set(vocab_sizes)) == 1, "All workers should have the same vocab_size"
+        assert vocab_sizes[0] > 0
+
+        # Verify shapes are correct
+        for dataset in datasets:
+            for inputs, labels in dataset:
+                assert inputs.shape == (batch_size, 128)
+                assert labels.shape == (batch_size, 128)
 
 
 class TestWorkerConfigDatasetIntegration:

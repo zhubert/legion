@@ -72,9 +72,33 @@ python sim/train.py --workers 4 --model tiny --compress int8
 
 ### Running Distributed Training
 
-**Option 1: Automated 2-Worker Test (Recommended)**
+**Important:** The coordinator controls all training configuration (dataset, model, hyperparameters). Workers automatically fetch and execute the coordinator's decisions.
+
+**Option 1: One-Command Orchestrator (Recommended)**
 ```bash
-# Terminal 1: Start coordinator
+# Start all services (coordinator + 2 workers + assembler) in one terminal
+python scripts/start_services.py
+
+# With log files
+python scripts/start_services.py --logs-dir logs
+
+# Custom number of workers
+python scripts/start_services.py --workers 3
+
+# Skip assembler service
+python scripts/start_services.py --no-assembler
+```
+
+This orchestrator:
+- Starts coordinator, workers, and checkpoint assembler
+- Color-codes output per service for easy reading
+- Handles graceful shutdown with Ctrl+C
+- Optionally writes logs to separate files
+- Shows unified, timestamped output from all services
+
+**Option 2: Automated 2-Worker Test**
+```bash
+# Terminal 1: Start coordinator (uses default config)
 python -m coordinator.server
 
 # Terminal 2: Run automated test
@@ -83,52 +107,72 @@ python scripts/test_two_workers.py
 
 This script will:
 - Start 2 workers automatically
+- Workers fetch training config from coordinator
 - Run 50 training steps with real distributed training
 - Verify gradient synchronization and parameter exchange
 - Report performance metrics and loss convergence
 
-**Option 2: Manual Multi-Worker Setup**
+**Option 3: Manual Multi-Worker Setup with Custom Configuration**
 ```bash
 # Terminal 1: Start coordinator
 python -m coordinator.server
 # Server runs on http://localhost:8000
 
-# Terminal 2: Start worker 1
+# Terminal 2: Configure training (optional - coordinator has sensible defaults)
+curl -X PUT http://localhost:8000/training/config \
+  -H "Content-Type: application/json" \
+  -d '{"dataset_type": "distributed_dummy", "batch_size": 4, "num_steps": 100}'
+
+# Terminal 3: Start worker 1 (automatically fetches config from coordinator)
 python -m worker.client
 
-# Terminal 3: Start worker 2
+# Terminal 4: Start worker 2 (automatically fetches config from coordinator)
 python -m worker.client
 ```
 
 Workers will automatically:
 - Register with the coordinator
+- **Fetch training configuration from coordinator**
 - Send periodic heartbeats
 - Wait for peers to be ready
 - Form a training cluster
+- Execute training with coordinator's configuration
 - Exchange parameters via gRPC
 - Synchronize gradients across workers
 
-### Training on Real Datasets
+### Training Configuration (Coordinator-Driven)
 
-Legion supports HuggingFace datasets for production training:
+**Key Design Principle:** The coordinator makes all training decisions (dataset, model, hyperparameters). Workers simply execute the coordinator's configuration.
+
+**Setting Training Configuration:**
 
 ```bash
-# Install HuggingFace dependencies (optional)
-pip install datasets transformers
+# Option 1: Start coordinator with default config (distributed_dummy dataset)
+python -m coordinator.server
 
-# Train on Tiny Shakespeare (good for testing)
-python -m worker.client \
-    --dataset-type huggingface \
-    --dataset-name tiny_shakespeare \
-    --batch-size 16 \
-    --seq-len 256
+# Option 2: Configure via API after startup
+curl -X PUT http://localhost:8000/training/config \
+  -H "Content-Type: application/json" \
+  -d '{
+    "dataset_type": "huggingface",
+    "dataset_name": "tiny_shakespeare",
+    "model_size": "tiny",
+    "batch_size": 8,
+    "seq_len": 256,
+    "num_steps": 100
+  }'
 
-# Train on FineWeb-Edu (high-quality web data)
-python -m worker.client \
-    --dataset-type huggingface \
-    --dataset-name fineweb-edu \
-    --batch-size 8 \
-    --seq-len 1024
+# Option 3: Use Python to configure
+python -c "
+import requests
+requests.put('http://localhost:8000/training/config', json={
+    'dataset_type': 'huggingface',
+    'dataset_name': 'fineweb-edu',
+    'batch_size': 8,
+    'seq_len': 1024,
+    'num_steps': 1000
+})
+"
 ```
 
 **Available datasets:**
@@ -137,6 +181,13 @@ python -m worker.client \
 - `pile` - 825GB diverse dataset
 - `tiny_shakespeare` - 1MB for testing
 - `shakespeare` - Complete works of Shakespeare
+- `distributed_dummy` - Synthetic data for testing (default)
+
+**Workers automatically receive configuration from coordinator:**
+```bash
+# Workers no longer need dataset/model flags - they fetch config from coordinator
+python -m worker.client
+```
 
 ## Project Structure
 

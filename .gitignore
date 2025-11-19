@@ -152,6 +152,7 @@ checkpoints/
 
 # Logs
 *.log
+logs/
 
 # Data
 data/

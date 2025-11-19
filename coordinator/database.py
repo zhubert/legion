@@ -94,7 +94,10 @@ class Database:
                 global_step INTEGER NOT NULL,
                 worker_shards TEXT NOT NULL,
                 metadata TEXT,
-                created_at TIMESTAMP NOT NULL
+                created_at TIMESTAMP NOT NULL,
+                status TEXT DEFAULT 'initiated',
+                assembled_at TIMESTAMP,
+                assembled_path TEXT
             )
         """)
 
@@ -487,6 +490,98 @@ class Database:
             checkpoint['metadata'] = json.loads(checkpoint['metadata'])
 
         return checkpoint
+
+    def update_checkpoint_status(
+        self,
+        checkpoint_id: str,
+        status: str,
+        assembled_path: Optional[str] = None
+    ) -> bool:
+        """
+        Update checkpoint status and assembled path.
+
+        Args:
+            checkpoint_id: Checkpoint identifier
+            status: New status ('initiated', 'shards_saved', 'assembling', 'assembled', 'failed')
+            assembled_path: Optional path to assembled checkpoint file
+
+        Returns:
+            True if update successful
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        if assembled_path:
+            cursor.execute("""
+                UPDATE checkpoints
+                SET status = ?, assembled_at = ?, assembled_path = ?
+                WHERE checkpoint_id = ?
+            """, (status, datetime.now(UTC), assembled_path, checkpoint_id))
+        else:
+            cursor.execute("""
+                UPDATE checkpoints
+                SET status = ?
+                WHERE checkpoint_id = ?
+            """, (status, checkpoint_id))
+
+        conn.commit()
+        return cursor.rowcount > 0
+
+    def get_checkpoint_by_step(self, global_step: int) -> Optional[Dict[str, Any]]:
+        """
+        Get checkpoint by global step.
+
+        Args:
+            global_step: Training step
+
+        Returns:
+            Checkpoint info dictionary or None
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT * FROM checkpoints
+            WHERE global_step = ?
+            ORDER BY version DESC
+            LIMIT 1
+        """, (global_step,))
+
+        row = cursor.fetchone()
+        if row is None:
+            return None
+
+        checkpoint = dict(row)
+        checkpoint['worker_shards'] = json.loads(checkpoint['worker_shards'])
+        if checkpoint['metadata']:
+            checkpoint['metadata'] = json.loads(checkpoint['metadata'])
+
+        return checkpoint
+
+    def list_checkpoints(self) -> List[Dict[str, Any]]:
+        """
+        List all checkpoints.
+
+        Returns:
+            List of checkpoint info dictionaries
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT * FROM checkpoints
+            ORDER BY global_step DESC
+        """)
+
+        checkpoints = []
+        for row in cursor.fetchall():
+            checkpoint = dict(row)
+            checkpoint['worker_shards'] = json.loads(checkpoint['worker_shards'])
+            if checkpoint['metadata']:
+                checkpoint['metadata'] = json.loads(checkpoint['metadata'])
+            checkpoints.append(checkpoint)
+
+        return checkpoints
 
     # Metrics operations
 

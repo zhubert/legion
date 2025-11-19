@@ -80,36 +80,45 @@ class CoordinatorClient:
     async def wait_at_barrier(
         self,
         step: str = "training_complete",
+        global_step: Optional[int] = None,
         poll_interval: float = 5.0,
         timeout: float = 300.0
-    ) -> bool:
+    ) -> tuple[bool, Optional[int]]:
         """
         Wait at a distributed barrier until all workers reach it.
 
         Args:
             step: Barrier step name
+            global_step: Training step number (for checkpoint creation)
             poll_interval: How often to poll in seconds (default: 5.0)
             timeout: Maximum time to wait in seconds (default: 300.0)
 
         Returns:
-            True if barrier completed, False if timeout
+            Tuple of (success: bool, agreed_global_step: Optional[int])
+            - success: True if barrier completed, False if timeout
+            - agreed_global_step: The global_step agreed upon by all workers (if provided)
         """
         import asyncio
         elapsed = 0.0
 
         while elapsed < timeout:
             try:
+                params = {"worker_id": self.worker_id, "step": step}
+                if global_step is not None:
+                    params["global_step"] = global_step
+
                 response = await self._request_with_retry(
                     "POST",
                     "/training/barrier",
-                    params={"worker_id": self.worker_id, "step": step}
+                    params=params
                 )
 
                 data = response.json()
 
                 if data and data.get("all_ready"):
-                    logger.info(f"Barrier '{step}' complete - all workers ready")
-                    return True
+                    agreed_step = data.get("global_step")
+                    logger.info(f"Barrier '{step}' complete - all workers ready (global_step={agreed_step})")
+                    return (True, agreed_step)
 
                 reached = data.get("reached", 0)
                 total = data.get("total", 0)
@@ -127,7 +136,7 @@ class CoordinatorClient:
             elapsed += poll_interval
 
         logger.error(f"Barrier '{step}' timeout after {timeout}s")
-        return False
+        return (False, None)
 
     async def close(self):
         """Close HTTP client."""
@@ -514,6 +523,34 @@ class CoordinatorClient:
         except httpx.HTTPError as e:
             logger.warning(f"Failed to compute clusters: {e}")
             return False
+
+    async def get_training_config(self) -> Optional[Dict[str, Any]]:
+        """
+        Get worker-specific training configuration from coordinator.
+
+        This includes the global training config plus worker-specific settings
+        like rank, world_size, and any custom overrides (e.g., batch size).
+
+        Returns:
+            Training configuration dict or None if failed
+        """
+        try:
+            response = await self._request_with_retry(
+                "GET",
+                f"/training/config/worker/{self.worker_id}"
+            )
+
+            data = response.json()
+
+            logger.info(
+                f"Fetched training config from coordinator: "
+                f"rank={data.get('rank')}, world_size={data.get('world_size')}"
+            )
+            return data
+
+        except httpx.HTTPError as e:
+            logger.error(f"Failed to get training config: {e}")
+            return None
 
     def is_registered(self) -> bool:
         """

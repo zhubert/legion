@@ -53,6 +53,10 @@ class VersionManager:
         # Work stealing assignment
         self.backup_assignments: Dict[str, str] = {}  # ahead_worker_id -> slow_worker_id
 
+        # Global version cache
+        self._cached_global_version: Optional[int] = None
+        self._cache_dirty: bool = True
+
         logger.info(f"Initialized VersionManager (staleness_bound={staleness_bound})")
 
     def update_worker_version(self, worker_id: str, version: int, is_healthy: bool = True):
@@ -71,6 +75,9 @@ class VersionManager:
             is_healthy=is_healthy
         )
 
+        # Invalidate cache when worker versions change
+        self._cache_dirty = True
+
         logger.debug(f"Worker {worker_id} updated to version {version}")
 
     def mark_worker_offline(self, worker_id: str):
@@ -82,6 +89,8 @@ class VersionManager:
         """
         if worker_id in self.worker_versions:
             del self.worker_versions[worker_id]
+            # Invalidate cache when worker count changes
+            self._cache_dirty = True
             logger.info(f"Removed worker {worker_id} from version tracking")
 
         # Clean up any backup assignments involving this worker
@@ -101,18 +110,32 @@ class VersionManager:
         Using median instead of minimum prevents one straggler from
         blocking the entire cluster.
 
+        Uses caching to avoid redundant O(n log n) median calculations.
+        Cache is invalidated whenever worker versions are updated.
+
         Returns:
             Global version (median of active workers), 0 if no workers
         """
+        # Return cached value if still valid
+        if not self._cache_dirty and self._cached_global_version is not None:
+            return self._cached_global_version
+
+        # Recompute global version
         active_versions = [
             wv.version for wv in self.worker_versions.values()
             if wv.is_healthy
         ]
 
         if not active_versions:
+            self._cached_global_version = 0
+            self._cache_dirty = False
             return 0
 
         global_version = int(statistics.median(active_versions))
+
+        # Update cache
+        self._cached_global_version = global_version
+        self._cache_dirty = False
 
         # Record in history
         self.version_history.append((time.time(), global_version))

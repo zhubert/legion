@@ -24,16 +24,23 @@ Single-machine simulation that validates distributed training concepts. Workers 
 - `sim/worker.py` - Worker coordinator for simulation
 
 ### 2. Coordinator Server (`coordinator/`)
-Central coordinator managing worker registry, health monitoring, and regional clustering.
+Central coordinator managing worker registry, health monitoring, regional clustering, and **training configuration**.
 
 **Key files:**
 - `coordinator/server.py` - FastAPI server with REST + WebSocket endpoints
 - `coordinator/registry.py` - Worker registration and lifecycle management
 - `coordinator/clustering.py` - Latency-based regional clustering
 - `coordinator/database.py` - SQLite persistence
+- `coordinator/training_config.py` - **Training configuration management (NEW)**
+
+**Training Configuration (Coordinator-Driven):**
+- **The coordinator makes ALL training decisions**: dataset, model, hyperparameters, compression, etc.
+- Workers fetch their configuration from the coordinator on startup
+- Supports worker-specific overrides (e.g., custom batch size based on GPU memory)
+- Ensures all workers train consistently on the same model/dataset
 
 **Communication:**
-- Workers use REST for registration/heartbeat
+- Workers use REST for registration/heartbeat and fetching training config
 - WebSocket for real-time event broadcasting
 - Coordinator is NOT in the training loop (peer-to-peer worker communication)
 
@@ -58,7 +65,93 @@ Handles worker-to-worker communication via gRPC.
 - `communication/serialization.py` - Tensor serialization with chunking for large transfers
 - `communication/proto/` - Protocol buffer definitions
 
+## Training Configuration (Coordinator-Driven Design)
+
+**Philosophy:** The coordinator is the single source of truth for all training decisions. Workers are execution engines that fetch and follow the coordinator's configuration.
+
+### Why Coordinator-Driven Configuration?
+
+1. **Consistency**: All workers must train the same model on the same dataset with the same hyperparameters
+2. **Centralized Control**: Operator configures training once at the coordinator, not per-worker
+3. **Dynamic Adjustment**: Can adjust batch sizes per worker based on hardware capabilities
+4. **Fault Tolerance**: New workers joining mid-training automatically get the correct configuration
+
+### Configuration Workflow
+
+```bash
+# 1. Start coordinator (uses sensible defaults)
+python -m coordinator.server
+
+# 2. Configure training (optional - can do this before or after workers join)
+curl -X PUT http://localhost:8000/training/config \
+  -H "Content-Type: application/json" \
+  -d '{
+    "dataset_type": "huggingface",
+    "dataset_name": "tiny_shakespeare",
+    "model_size": "tiny",
+    "batch_size": 8,
+    "seq_len": 256,
+    "learning_rate": 0.001,
+    "num_steps": 1000,
+    "compression": "int8"
+  }'
+
+# 3. Start workers (they automatically fetch config from coordinator)
+python -m worker.client  # Worker 1
+python -m worker.client  # Worker 2
+
+# 4. View current config
+curl http://localhost:8000/training/config
+
+# 5. Get worker-specific config (includes rank, world_size, any overrides)
+curl http://localhost:8000/training/config/worker/{worker_id}
+
+# 6. Set custom batch size for specific worker (e.g., GPU worker can handle more)
+curl -X PUT http://localhost:8000/training/config/worker/{worker_id}/batch_size \
+  -H "Content-Type: application/json" \
+  -d '8'
+```
+
+### What the Coordinator Controls
+
+- **Dataset**: Type (dummy/huggingface), name (fineweb, pile, shakespeare), tokenizer
+- **Model**: Architecture size (tiny, small, medium)
+- **Hyperparameters**: Batch size, sequence length, learning rate, training steps
+- **Compression**: Strategy (none, int8, topk)
+- **Worker-Specific Overrides**: Custom batch sizes based on hardware
+
+### What Workers Do
+
+Workers **no longer** make training decisions via CLI flags. They:
+1. Register with coordinator
+2. **Fetch training configuration from coordinator**
+3. Load the assigned dataset shard (based on rank/world_size from coordinator)
+4. Execute training with coordinator's hyperparameters
+
 ## Development Commands
+
+### Running All Services (Recommended)
+
+```bash
+# Start coordinator + workers + assembler in one terminal
+python scripts/start_services.py
+
+# With log files
+python scripts/start_services.py --logs-dir logs
+
+# Custom number of workers
+python scripts/start_services.py --workers 3
+
+# Skip assembler
+python scripts/start_services.py --no-assembler
+```
+
+The `start_services.py` orchestrator:
+- Starts all required services with color-coded, unified output
+- Handles graceful shutdown with Ctrl+C
+- Optionally writes separate log files per service
+- Shows timestamped output from all processes
+- Configurable worker count
 
 ### Running Tests
 ```bash
@@ -95,17 +188,25 @@ python sim/train.py --mode both --workers 4 --steps 100
 
 ### Running Coordinator Server
 ```bash
-# Start coordinator
+# Start coordinator (uses default training config)
 python -m coordinator.server
 
 # Or with uvicorn directly
 uvicorn coordinator.server:app --reload --host 0.0.0.0 --port 8000
+
+# Configure training via API (can be done before or after workers join)
+curl -X PUT http://localhost:8000/training/config \
+  -H "Content-Type: application/json" \
+  -d '{"dataset_type": "distributed_dummy", "batch_size": 4, "num_steps": 100}'
 ```
 
 ### Running Worker Client
 ```bash
-# Start worker (connects to local coordinator by default)
+# Start worker (automatically fetches config from coordinator)
 python -m worker.client
+
+# Workers no longer need --dataset-type, --batch-size, etc.
+# All training configuration comes from the coordinator
 
 # Or via asyncio
 python -c "import asyncio; from worker.client import main; asyncio.run(main())"
@@ -230,17 +331,19 @@ Following the author's style guide (STYLEGUIDE.md):
 
 ## Common Pitfalls
 
-1. **Coordinator is NOT in the training loop**: Workers communicate peer-to-peer for training. Coordinator only manages discovery, health, and clustering.
+1. **Coordinator-driven configuration**: Workers do NOT choose their own dataset, model, or hyperparameters. The coordinator makes ALL training decisions. Workers fetch configuration from the coordinator on startup via `/training/config/worker/{worker_id}`. If you're setting `--dataset-type` or similar flags on workers, you're doing it wrong.
 
-2. **Simulation vs Real Distribution**: The `sim/` code simulates multiple workers in one process. The `worker/` code runs actual distributed workers. Don't confuse them.
+2. **Coordinator is NOT in the training loop**: Workers communicate peer-to-peer for training. Coordinator only manages discovery, health, clustering, and **configuration**.
 
-3. **Parameter ownership**: In ZeRO-3, each worker only updates parameters it owns. All-gather temporarily brings all parameters for computation.
+3. **Simulation vs Real Distribution**: The `sim/` code simulates multiple workers in one process. The `worker/` code runs actual distributed workers. Don't confuse them.
 
-4. **Async/await**: Worker client uses asyncio extensively. Remember to await async functions and use `asyncio.run()` for entry points.
+4. **Parameter ownership**: In ZeRO-3, each worker only updates parameters it owns. All-gather temporarily brings all parameters for computation.
 
-5. **Device management**: The simulation defaults to CPU. Real workers should detect GPU availability via `torch.cuda.is_available()`.
+5. **Async/await**: Worker client uses asyncio extensively. Remember to await async functions and use `asyncio.run()` for entry points.
 
-6. **NO RING TOPOLOGIES**: Legion explicitly does NOT use ring-based collectives (ring allreduce, etc.). Ring topologies assume stable, synchronous workers completing at the same time - the exact opposite of Legion's design. Legion has hundreds of heterogeneous consumer machines (CPU/GPU mix) joining/leaving dynamically and finishing training units at vastly different times. The peer-to-peer async all-gather/reduce-scatter architecture is the correct approach for this use case.
+6. **Device management**: The simulation defaults to CPU. Real workers should detect GPU availability via `torch.cuda.is_available()`.
+
+7. **NO RING TOPOLOGIES**: Legion explicitly does NOT use ring-based collectives (ring allreduce, etc.). Ring topologies assume stable, synchronous workers completing at the same time - the exact opposite of Legion's design. Legion has hundreds of heterogeneous consumer machines (CPU/GPU mix) joining/leaving dynamically and finishing training units at vastly different times. The peer-to-peer async all-gather/reduce-scatter architecture is the correct approach for this use case.
 
 ## Dependencies
 
